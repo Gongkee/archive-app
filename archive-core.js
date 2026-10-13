@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 档案 · 核心逻辑
  *
  * 浏览器和 Node 都能跑：不碰文件系统，存储走 GitHub API，模型走 fetch。
@@ -604,8 +604,15 @@ async function saveImages(g, dataUrls) {
       { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' }[m[1]] || 'jpg';
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '');
     const name = `images/${stamp}-${Math.random().toString(16).slice(2, 8)}.${ext}`;
-    await ghPutB64(g, name, m[2], null, `图片 ${name}`);
-    out.push({ name, rel: name, dataUrl: du });
+    try {
+      await ghPutB64(g, name, m[2], null, `图片 ${name}`);
+      out.push({ name, rel: name, dataUrl: du });
+    } catch (err) {
+      // 图片没存上不能拖垮整轮：模型还是能用 data URL 看到它，
+      // 只是不能给它一个会写进档案的路径 —— 那会变成死链。
+      console.warn(`图片没存上（${err.message}）；这轮照常聊，但档案里不会引用这张图`);
+      out.push({ name, rel: null, dataUrl: du, failed: true });
+    }
   }
   return out;
 }
@@ -626,7 +633,11 @@ async function runTurn(cfg, history, input) {
   const hasVision = Boolean(cfg.vision?.apiKey && cfg.vision?.baseUrl && cfg.vision?.model);
 
   const userText = String(input?.text || '').trim();
-  const imageLines = images.map((i) => `图片路径（要写进档案时原样引用）：${i.rel}`).join('\n');
+  // 只有真的存上去了才给它路径 —— 否则模型会往档案里写一条死链
+  const imageLines = images
+    .filter((i) => i.rel)
+    .map((i) => `图片路径（要写进档案时原样引用）：${i.rel}`)
+    .join('\n');
 
   let userContent;
   if (hasVision && images.length) {
@@ -679,32 +690,41 @@ async function runTurn(cfg, history, input) {
   if (!reply) reply = '我这边卡了一下，你再说一句试试？';
 
   // 写回。中途在别处被改过就重读、重放，最多三次。
+  //
+  // ⚠ 写失败**不能连累回复**：话已经生成了，必须让用户看到。
+  // 之前这里是直接 throw 的，结果档案写不进去的时候连 AI 说的话都丢了。
   let updated = false;
+  let writeError = null;
   if (updates.length) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      let next = md;
-      for (const u of updates) {
-        if (!u || !u.section || typeof u.content !== 'string') continue;
-        const name = String(u.section).trim().replace(/^#+\s*/, '');
-        if (!name) continue;
-        next = replaceSection(next, name, u.content);
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        let next = md;
+        for (const u of updates) {
+          if (!u || !u.section || typeof u.content !== 'string') continue;
+          const name = String(u.section).trim().replace(/^#+\s*/, '');
+          if (!name) continue;
+          next = replaceSection(next, name, u.content);
+        }
+        if (next === md) break;
+        try {
+          await ghPut(g, g.journalPath || 'journal.md', next, sha, `档案更新 ${now.text}`);
+          updated = true;
+          break;
+        } catch (err) {
+          if (!err.conflict || attempt === 2) throw err;
+          console.warn('⚠ 档案在别处被改过，重读之后重放这次更新');
+          const fresh = await readJournal(g);
+          md = fresh.md;
+          sha = fresh.sha;
+        }
       }
-      if (next === md) break;
-      try {
-        await ghPut(g, g.journalPath || 'journal.md', next, sha, `档案更新 ${now.text}`);
-        updated = true;
-        break;
-      } catch (err) {
-        if (!err.conflict || attempt === 2) throw err;
-        console.warn('⚠ 档案在别处被改过，重读之后重放这次更新');
-        const fresh = await readJournal(g);
-        md = fresh.md;
-        sha = fresh.sha;
-      }
+    } catch (err) {
+      writeError = err.message;
+      console.warn(`⚠ 档案没写进 GitHub：${err.message}（但回复照常给）`);
     }
   }
 
-  return { reply, updated, images: images.map((i) => i.rel) };
+  return { reply, updated, writeError, images: images.map((i) => i.rel).filter(Boolean) };
 }
 
 export {

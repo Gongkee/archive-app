@@ -302,7 +302,7 @@ function render() {
       b.textContent = t.text;
       d.appendChild(b);
     }
-    if (t.at || t.updated || t.error) {
+    if (t.at || t.updated || t.writeError) {
       const meta = document.createElement('div');
       meta.className = 'meta';
       if (t.at) {
@@ -315,11 +315,11 @@ function render() {
         tag.className = 'tag';
         tag.textContent = '已写入档案';
         meta.appendChild(tag);
-      }
-      if (t.error) {
+      } else if (t.writeError) {
         const tag = document.createElement('span');
         tag.className = 'tag err';
         tag.textContent = '没写进档案';
+        tag.title = t.writeError;
         meta.appendChild(tag);
       }
       d.appendChild(meta);
@@ -423,10 +423,16 @@ async function send() {
   try {
     const r = await runTurn(cfg, history, { text, images: imgs });
     thinking(false);
-    turns.push({ role: 'assistant', text: r.reply || '（没有回复）', updated: r.updated, at: Date.now() });
+    turns.push({
+      role: 'assistant',
+      text: r.reply || '（没有回复）',
+      updated: r.updated,
+      writeError: r.writeError || null,
+      at: Date.now(),
+    });
   } catch (err) {
     thinking(false);
-    turns.push({ role: 'assistant', text: '出错了：' + err.message, at: Date.now(), error: true });
+    turns.push({ role: 'assistant', text: '出错了：' + err.message, at: Date.now() });
   } finally {
     busy = false;
     $('#send').disabled = false;

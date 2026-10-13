@@ -354,6 +354,38 @@ await checkAsync('GitHub 令牌无效 → 报清楚，而不是静默失败', as
   await assert.rejects(() => runTurn(CFG, [], { text: '你好', images: [] }), /令牌无效/);
 });
 
+await checkAsync('档案写不进去时，回复照样给用户（不能连话都丢了）', async () => {
+  installFetch([
+    (u, m) => (u.includes('/contents/journal.md') && m === 'GET' ? jsonRes(200, { content: textToB64(HEAD), sha: 's' }) : null),
+    (u, m) => (u.includes('/contents/journal.md') && m === 'PUT' ? jsonRes(500, { message: '服务器炸了' }) : null),
+    (u) => (u.includes('/chat/completions') ? modelSays({ reply: '记上了。', updates: [{ section: '身体', content: '| a |' }] }) : null),
+  ]);
+  const r = await runTurn(CFG, [], { text: '体重150斤', images: [] });
+  assert.strictEqual(r.reply, '记上了。', '回复被写失败连累丢了 —— 这正是要防的');
+  assert.strictEqual(r.updated, false);
+  assert.ok(r.writeError, '应该标明这轮没写进去');
+});
+
+await checkAsync('图片存不上去也不影响这轮对话，且不会往档案里写死链', async () => {
+  let chatBody = null;
+  installFetch([
+    (u, m) => (u.includes('/contents/journal.md') && m === 'GET' ? jsonRes(404, { message: 'Not Found' }) : null),
+    (u, m) => (u.includes('/contents/images/') && m === 'PUT' ? jsonRes(500, { message: '炸了' }) : null),
+    (u, m, b) => {
+      if (!u.includes('/chat/completions')) return null;
+      chatBody = b;
+      return modelSays({ reply: '看不清', updates: [] });
+    },
+  ]);
+  const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const cfgV = { ...CFG, vision: { baseUrl: 'https://v.example.com/v1', apiKey: 'vk', model: 'vm' } };
+  const r = await runTurn(cfgV, [], { text: '', images: [png] });
+  assert.strictEqual(r.reply, '看不清');
+  assert.deepStrictEqual(r.images, [], '存不上的图片不该出现在返回结果里');
+  const textPart = chatBody.messages.at(-1).content.find((p) => p.type === 'text');
+  assert.ok(!/images\//.test(textPart.text), '不该给模型一条会变成死链的路径：' + textPart.text);
+});
+
 await checkAsync('图片会先存进 GitHub，路径再交给模型', async () => {
   const puts = [];
   let sentBody = null;
