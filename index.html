@@ -194,7 +194,7 @@
 <div id="toast"></div>
 
 <script type="module">
-import { runTurn, readJournal, localNow } from './archive-core.js';
+import { runTurn, readJournal, localNow, normalizeBaseUrl, fetchWithTimeout, DEFAULT_TIMEOUT_MS } from './archive-core.js';
 
 const $ = (s) => document.querySelector(s);
 const CFG_KEY = 'archive.config.v1';
@@ -335,16 +335,23 @@ function scrollDown() {
     box.scrollTop = box.scrollHeight;
   });
 }
-function thinking(on) {
+function thinking(on, text) {
   const old = $('#thinking');
   if (old) old.remove();
   if (!on) return;
   const d = document.createElement('div');
   d.className = 'msg ai';
   d.id = 'thinking';
-  d.innerHTML = '<div class="thinking">在想</div>';
+  d.innerHTML = '<div class="thinking"></div>';
+  d.firstChild.textContent = text || '在想';
   $('#chat').appendChild(d);
   scrollDown();
+}
+/** 更新正在转的那行字（不重建节点，免得动画每次重来） */
+function thinkSay(text) {
+  const el = $('#thinking .thinking');
+  if (el) el.textContent = text;
+  else thinking(true, text);
 }
 let toastTimer;
 function toast(msg, ms = 2400) {
@@ -421,7 +428,7 @@ async function send() {
   saveSession();
 
   try {
-    const r = await runTurn(cfg, history, { text, images: imgs });
+    const r = await runTurn(cfg, history, { text, images: imgs }, { phase: thinkSay });
     thinking(false);
     turns.push({ role: 'assistant', text: r.reply || '（没有回复）', updated: r.updated, at: Date.now() });
   } catch (err) {
@@ -542,12 +549,12 @@ $('#btnSave').onclick = () => {
   if (!c.github.branch) c.github.branch = 'main';
 
   c.chat = c.chat || {};
-  setIf(c.chat, 'baseUrl', $('#c_base').value);
+  setIf(c.chat, 'baseUrl', normalizeBaseUrl($('#c_base').value));
   setIf(c.chat, 'model', $('#c_model').value);
   setIf(c.chat, 'apiKey', $('#c_key').value);
 
   c.vision = c.vision || {};
-  setIf(c.vision, 'baseUrl', $('#v_base').value);
+  setIf(c.vision, 'baseUrl', normalizeBaseUrl($('#v_base').value));
   setIf(c.vision, 'model', $('#v_model').value);
   setIf(c.vision, 'apiKey', $('#v_key').value);
 
@@ -561,29 +568,90 @@ $('#btnSave').onclick = () => {
   toast(miss.length ? '已保存 · 还缺：' + miss.join('、') : '已保存');
 };
 
+/**
+ * 测试连接。
+ *
+ * ⚠ 以前这里只测 GitHub 和聊天模型 —— 所以会出现「两行都通了」但拍照仍然
+ * 认不出来（视觉那一栏根本没被验证过）。现在视觉也真发一张图进去测。
+ */
 $('#btnTest').onclick = async () => {
   const c = loadCfg();
-  toast('测试中…', 10000);
+  toast('测试中…', 30000);
   const lines = [];
+
+  // ── GitHub
   try {
     const { md } = await readJournal(c.github);
-    lines.push(`GitHub 通了（档案 ${md.length} 字）`);
+    lines.push(`✓ GitHub 通了（档案 ${md.length} 字）`);
   } catch (e) {
-    lines.push('GitHub 不通：' + e.message);
+    lines.push('✗ GitHub 不通：' + e.message);
   }
+
+  // ── 聊天模型
   try {
-    const res = await fetch((c.chat.baseUrl || '').replace(/\/+$/, '') + '/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + c.chat.apiKey },
-      body: JSON.stringify({ model: c.chat.model, messages: [{ role: 'user', content: '回复：OK' }], max_tokens: 5 }),
-    });
-    lines.push(res.ok ? '模型通了' : `模型失败 ${res.status}：${(await res.text()).slice(0, 80)}`);
+    lines.push(await slotTest(c.chat, '聊天模型'));
   } catch (e) {
-    lines.push('模型不通：' + e.message);
+    lines.push('✗ 聊天模型不通：' + e.message);
   }
+
+  // ── 视觉模型（留空就跟着聊天模型走，和发照片时的规则一致）
+  const own = !!(c.vision?.apiKey && c.vision?.baseUrl && c.vision?.model);
+  const v = own ? c.vision : c.chat;
+  try {
+    lines.push(await slotTest(v, own ? '视觉模型' : '视觉模型（留空，用聊天模型）', true));
+  } catch (e) {
+    lines.push(`✗ ${own ? '视觉模型' : '视觉模型（留空，用聊天模型）'}不通：` + e.message);
+  }
+
   alert(lines.join('\n'));
   toast('测试完成');
 };
+
+/**
+ * 真的发一次请求，而不是只看 Key 填了没有。
+ * 测视觉时塞一张已知的白色小图：能回复才算这一栏可用。
+ */
+async function slotTest(slot, label, withImage = false) {
+  if (!slot?.baseUrl || !slot?.apiKey || !slot?.model) return `✗ ${label}：接口地址 / 模型名 / Key 没填全`;
+
+  const content = withImage
+    ? [
+        { type: 'text', text: '这是一张什么颜色的图？只答颜色。' },
+        {
+          type: 'image_url',
+          image_url: {
+            url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+          },
+        },
+      ]
+    : '回复：OK';
+
+  const t0 = Date.now();
+  const res = await fetchWithTimeout(
+    slot.baseUrl.replace(/\/+$/, '') + '/chat/completions',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + slot.apiKey },
+      body: JSON.stringify({
+        model: slot.model,
+        messages: [{ role: 'user', content }],
+        max_tokens: 20,
+      }),
+    },
+    DEFAULT_TIMEOUT_MS
+  );
+  const body = await res.text();
+  if (!res.ok) {
+    let hint = body.slice(0, 120);
+    try {
+      const j = JSON.parse(body);
+      hint = j.error?.message || j.message || hint;
+    } catch {}
+    throw new Error(`${res.status}：${hint}`);
+  }
+  const secs = ((Date.now() - t0) / 1000).toFixed(1);
+  return `✓ ${label}通了（${slot.model} · ${secs}s）`;
+}
 
 /* ── 启动 ─────────────────────────────── */
 loadSession();

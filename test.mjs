@@ -11,6 +11,11 @@ import { readFileSync, existsSync } from 'node:fs';
 import * as core from './archive-core.js';
 import {
   MAX_HISTORY,
+  DEFAULT_TIMEOUT_MS,
+  fetchWithTimeout,
+  normalizeBaseUrl,
+  applyThinking,
+  isDeepSeek,
   buildMessages,
   parseModelJSON,
   salvageReply,
@@ -389,6 +394,126 @@ await checkAsync('图片会先存进 GitHub，路径再交给模型', async () =
   const userMsg = sentBody.messages.at(-1);
   assert.ok(Array.isArray(userMsg.content), '图片应该以数组形式发过去');
   assert.ok(userMsg.content.some((p) => p.type === 'image_url'), '图片没带上');
+});
+
+await checkAsync('视觉栏留空 → 图片自动交给聊天模型', async () => {
+  const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  let sent = null;
+  installFetch([
+    (u, m) => (m === 'GET' ? jsonRes(200, { content: textToB64(HEAD), sha: 's1' }) : null),
+    (u, m, b) => {
+      if (u.includes('/contents/images/') && m === 'PUT') return jsonRes(200, { content: { sha: 'x' } });
+      if (u.includes('/contents/journal.md') && m === 'PUT') return jsonRes(200, { content: { sha: 's2' } });
+      return null;
+    },
+    (u, m, b) => {
+      if (u.includes('/chat/completions')) {
+        sent = b;
+        return modelSays({ reply: '看到了', updates: [] });
+      }
+      return null;
+    },
+  ]);
+
+  // vision 三栏全空（test.mjs 的 CFG 本来就是空的），只有聊天模型
+  const r = await runTurn(CFG, [], { text: '', images: [png] });
+  assert.strictEqual(r.reply, '看到了');
+  assert.ok(sent, '没发出模型请求');
+  assert.strictEqual(sent.model, 'm', '应该用聊天模型');
+  const last = sent.messages.at(-1);
+  assert.ok(Array.isArray(last.content), '留空时图片也必须以数组形式发出去');
+  assert.ok(last.content.some((p) => p.type === 'image_url'), '留空时图片没带上');
+});
+
+// ═══════════════════════════════ 超时
+console.log('\n── 超时（不给超时就会永远卡在「在想。。」）──');
+
+await checkAsync('接口不回时，fetchWithTimeout 会明确超时，不会死等', async () => {
+  const real = globalThis.fetch;
+  // 模拟半死不活的连接：既不响应，也不报错
+  globalThis.fetch = (url, opts = {}) =>
+    new Promise((_, reject) => {
+      opts.signal?.addEventListener('abort', () => {
+        const e = new Error('aborted');
+        e.name = 'AbortError';
+        reject(e);
+      });
+    });
+  try {
+    await assert.rejects(
+      () => fetchWithTimeout('https://api.example.com/v1/chat/completions', {}, 40),
+      (err) => {
+        assert.ok(err.timeout, '超时错误应该带 timeout 标记');
+        assert.match(err.message, /40 秒|没有响应/);
+        return true;
+      }
+    );
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+await checkAsync('正常响应照常返回，超时器不会误伤', async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => 'ok' });
+  try {
+    const r = await fetchWithTimeout('https://api.example.com/x', {}, 500);
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(await r.text(), 'ok');
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+check('默认超时是一个有限的正数', () => {
+  assert.ok(Number.isFinite(DEFAULT_TIMEOUT_MS), '默认超时必须是有限数字，否则等于没超时');
+  assert.ok(DEFAULT_TIMEOUT_MS > 0 && DEFAULT_TIMEOUT_MS <= 300000);
+});
+
+check('核心逻辑里不再有裸 fetch（都必须带超时）', () => {
+  const src = readFileSync(new URL('./archive-core.js', import.meta.url), 'utf8');
+  const bare = [...src.matchAll(/(?<![.\w])fetch\(/g)];
+  assert.strictEqual(
+    bare.length,
+    1,
+    `archive-core.js 里应该只有 fetchWithTimeout 内部的那一处 fetch，实际有 ${bare.length} 处 —— 裸 fetch 会死等`
+  );
+  assert.ok(/function fetchWithTimeout/.test(src));
+});
+
+check('DeepSeek 关掉思考模式（否则只读 content 会一直转圈）', () => {
+  const b = applyThinking({ model: 'deepseek-flash' }, 'https://api.deepseek.com/v1');
+  assert.deepStrictEqual(b.thinking, { type: 'disabled' });
+});
+
+check('别家厂商不发 thinking 参数（非标准参数会 400）', () => {
+  const other = applyThinking(
+    { model: 'qwen-vl-max' },
+    'https://dashscope.aliyuncs.com/compatible-mode/v1'
+  );
+  assert.ok(!('thinking' in other), '给通义发了 thinking 参数，可能直接 400');
+});
+
+check('正确识别 DeepSeek 域名', () => {
+  assert.ok(isDeepSeek('https://api.deepseek.com'));
+  assert.ok(isDeepSeek('https://api.deepseek.com/v1'));
+  assert.ok(isDeepSeek('https://deepseek.com/v1'), '不带 api. 前缀的也要认');
+  assert.ok(isDeepSeek('https://api.deepseek.com:443/v1'), '带端口也要认');
+  assert.ok(!isDeepSeek('https://api.deepseek.com.evil.com/v1'), '域名后缀不能误判');
+  assert.ok(!isDeepSeek('https://notdeepseek.com/v1'), '前缀边界不能误判');
+  assert.ok(!isDeepSeek('https://api.moonshot.cn/v1'));
+  assert.ok(!isDeepSeek(''));
+});
+
+check('接口地址归一：deepseek 补上 /v1，其它原样', () => {
+  assert.strictEqual(normalizeBaseUrl('https://api.deepseek.com'), 'https://api.deepseek.com/v1');
+  assert.strictEqual(normalizeBaseUrl('https://api.deepseek.com/'), 'https://api.deepseek.com/v1');
+  assert.strictEqual(normalizeBaseUrl('https://api.deepseek.com/v1'), 'https://api.deepseek.com/v1');
+  assert.strictEqual(
+    normalizeBaseUrl('https://dashscope.aliyuncs.com/compatible-mode/v1'),
+    'https://dashscope.aliyuncs.com/compatible-mode/v1'
+  );
+  assert.strictEqual(normalizeBaseUrl('  '), '');
 });
 
 // ═══════════════════════════════ 时间
