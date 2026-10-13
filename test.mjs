@@ -474,15 +474,92 @@ check('默认超时是一个有限的正数', () => {
   assert.ok(DEFAULT_TIMEOUT_MS > 0 && DEFAULT_TIMEOUT_MS <= 300000);
 });
 
-check('核心逻辑里不再有裸 fetch（都必须带超时）', () => {
+// 手机上报错只给一句「Load failed」，分不出是 GitHub 还是模型挂了 —— 必须说清是谁
+console.log('\n── 拨不通的时候要说清是谁 ──');
+
+const deadFetch = (name) => {
+  const real = globalThis.fetch;
+  globalThis.fetch = () => {
+    const e = new TypeError(name);
+    return Promise.reject(e);
+  };
+  return () => {
+    globalThis.fetch = real;
+  };
+};
+
+await checkAsync('拨不通时带上标签和主机名，不再只有一句 Load failed', async () => {
+  const restore = deadFetch('Load failed');
+  try {
+    await assert.rejects(
+      () => fetchWithTimeout('https://api.example.com/v1/chat/completions', {}, 500, '模型接口（m）'),
+      (err) => {
+        assert.ok(!err.timeout, '这不是超时，别标成超时');
+        assert.match(err.message, /连不上模型接口（m）/);
+        assert.match(err.message, /api\.example\.com/, '得带上主机名，不然还是不知道连的谁');
+        assert.match(err.message, /Load failed/, '原始信息不能丢');
+        return true;
+      }
+    );
+  } finally {
+    restore();
+  }
+});
+
+await checkAsync('runTurn 里模型拨不通 → 报的是模型，不是 GitHub', async () => {
+  const restore = deadFetch('Load failed');
+  try {
+    // GitHub 走通，只有模型接口拨不通
+    globalThis.fetch = (u) =>
+      String(u).includes('github.com')
+        ? Promise.resolve(jsonRes(200, { content: textToB64(HEAD), sha: 's' }))
+        : Promise.reject(new TypeError('Load failed'));
+    await assert.rejects(() => runTurn(CFG, [], { text: '你好', images: [] }), (err) => {
+      assert.match(err.message, /连不上模型接口/, '应该指出是模型接口：' + err.message);
+      assert.ok(!/GitHub/.test(err.message), '别冤枉 GitHub：' + err.message);
+      return true;
+    });
+  } finally {
+    restore();
+  }
+});
+
+await checkAsync('GitHub 拨不通 → 报的是 GitHub', async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = (u) => {
+    if (String(u).includes('github.com')) return Promise.reject(new TypeError('Load failed'));
+    return Promise.resolve(jsonRes(200, { choices: [{ message: { content: '{}' } }], usage: {} }));
+  };
+  try {
+    await assert.rejects(() => runTurn(CFG, [], { text: '你好', images: [] }), (err) => {
+      assert.match(err.message, /连不上 GitHub/, '应该指出是 GitHub：' + err.message);
+      return true;
+    });
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+check('核心逻辑里只有一处 fetch，且必须带超时（裸 fetch 会死等）', () => {
   const src = readFileSync(new URL('./archive-core.js', import.meta.url), 'utf8');
-  const bare = [...src.matchAll(/(?<![.\w])fetch\(/g)];
+  // 数**所有** fetch 调用。以前用 lookbehind 排除 `.fetch(`，结果
+  // `() => fetch(` 也被一起排除了 —— 断言是绿的，但漏了真的裸 fetch。
+  const all = [...src.matchAll(/\bfetch\s*\(/g)].map((m) => m.index);
+  // 唯一允许的那一处，必须在 fetchWithTimeout 里面
+  const decl = src.search(/(?:async\s+)?function\s+fetchWithTimeout\b/);
+  assert.ok(decl >= 0, '找不到 fetchWithTimeout');
+  const bodyStart = src.indexOf('{', decl);
+  const bodyEnd = src.indexOf('\n}', bodyStart);
+  assert.ok(bodyStart > 0 && bodyEnd > bodyStart, 'fetchWithTimeout 的函数体没解析出来');
+
+  const outside = all.filter((i) => i < bodyStart || i > bodyEnd);
   assert.strictEqual(
-    bare.length,
-    1,
-    `archive-core.js 里应该只有 fetchWithTimeout 内部的那一处 fetch，实际有 ${bare.length} 处 —— 裸 fetch 会死等`
+    outside.length,
+    0,
+    `fetchWithTimeout 之外还有 ${outside.length} 处 fetch：` +
+      outside.map((i) => JSON.stringify(src.slice(i - 40, i + 30))).join(' | ')
   );
-  assert.ok(/function fetchWithTimeout/.test(src));
+  assert.strictEqual(all.length, 1, `整个文件应该只有一处 fetch，实际 ${all.length} 处`);
 });
 
 check('DeepSeek 关掉思考模式（否则只读 content 会一直转圈）', () => {

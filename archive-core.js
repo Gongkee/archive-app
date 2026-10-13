@@ -73,21 +73,28 @@ function stripImagesForRetry(messages, imageLines) {
   });
 }
 
+
 /**
- * 每个请求的上限。
- * 这条是拿真实故障换来的：原来所有 fetch 都没有超时，手机发图之后界面就
- * 卡在「在想。。」永远转下去 —— 视觉接口不回、连接半死不活、运营商挂起，
- * 三种情况表现完全一样，而且**四档重试会把整张图的 base64 再发三遍**，
- * 等待时间是四倍。宁可等到 90 秒报一个明确的「超时」，也不要无限等。
+ * 带超时、并且会报清楚「是谁连不上」的 fetch。
+ *
+ * 两件事都拿真实故障换来过：
+ *
+ * 1. **没有超时就会永远卡住**。原来一个超时都没有，手机发图之后界面就
+ *    卡在「在想。。」永远转下去 —— 视觉接口不回、连接半死不活、运营商挂起，
+ *    三种情况表现完全一样。宁可等到 150 秒报一句明确的「超时」。
+ *    150 秒是给「看图」留的余量：图片比纯文字慢，再叠上模型侧排队，
+ *    90 秒实测偏紧，会把本来能成功的一次误报成超时。
+ *
+ * 2. **网络层失败必须说清是谁**。`fetch` 拨不通时抛的是 TypeError，
+ *    message 只有 Safari 的「Load failed」或 Chrome 的「Failed to fetch」
+ *    —— 用户看到的就这一句，分不出是 GitHub 还是模型接口。所以用 label
+ *    把服务名和主机名（**不含 key**）挂在前面。
  *
  * 浏览器和 Node 都有 AbortController，不需要额外依赖。
- *
- * 150 秒是给「看图」留的余量：图片比纯文字慢，再叠上模型侧的排队和推理，
- * 90 秒实测偏紧，会把本来能成功的一次误报成超时。
  */
 const DEFAULT_TIMEOUT_MS = 150000;
 
-async function fetchWithTimeout(url, opts = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+async function fetchWithTimeout(url, opts = {}, timeoutMs = DEFAULT_TIMEOUT_MS, label = '') {
   const ctl = new AbortController();
   const ms = Number(timeoutMs) > 0 ? Number(timeoutMs) : DEFAULT_TIMEOUT_MS;
   const timer = setTimeout(() => ctl.abort(), ms);
@@ -100,7 +107,14 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = DEFAULT_TIMEOUT_MS) 
       e.timeout = true;
       throw e;
     }
-    throw err;
+    // 网络层失败：把「是谁」补上，别只留一句 Load failed
+    let host = '';
+    try {
+      host = new URL(String(url)).host;
+    } catch {}
+    const e = new Error(`连不上${label}${host ? '（' + host + '）' : ''}：${err?.message || err}`);
+    e.cause = err;
+    throw e;
   } finally {
     clearTimeout(timer);
   }
@@ -475,14 +489,19 @@ async function callModel(slot, messages, { json = false, temperature = 0.8, phas
   applyThinking(body, slot.baseUrl);
 
   const t0 = Date.now();
-  const res = await fetchWithTimeout(endpoint(slot.baseUrl), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${slot.apiKey}`,
+  const res = await fetchWithTimeout(
+    endpoint(slot.baseUrl),
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${slot.apiKey}`,
+      },
+      body: JSON.stringify(body),
     },
-    body: JSON.stringify(body),
-  });
+    DEFAULT_TIMEOUT_MS,
+    `模型接口（${slot.model}）`
+  );
   phase?.(`模型回应了 · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
   const text = await res.text();
@@ -647,10 +666,13 @@ function ghExplain(status, body) {
 }
 
 async function ghGet(g, path) {
-  const r = await fetchWithTimeout(`${ghUrl(g, path)}?ref=${encodeURIComponent(g.branch || 'main')}`, {
-    headers: ghHeaders(g),
-    cache: 'no-store',
-  });
+  const url = `${ghUrl(g, path)}?ref=${encodeURIComponent(g.branch || 'main')}`;
+  const r = await fetchWithTimeout(
+    url,
+    { headers: ghHeaders(g), cache: 'no-store' },
+    DEFAULT_TIMEOUT_MS,
+    ' GitHub'
+  );
   if (r.status === 404) return null;
   if (!r.ok) throw new Error(ghExplain(r.status, await r.text()));
   const j = await r.json();
@@ -665,11 +687,16 @@ async function ghPutB64(g, path, base64Content, sha, message) {
   const body = { message, content: base64Content, branch: g.branch || 'main' };
   if (sha) body.sha = sha;
 
-  const r = await fetchWithTimeout(ghUrl(g, path), {
-    method: 'PUT',
-    headers: { ...ghHeaders(g), 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  const r = await fetchWithTimeout(
+    ghUrl(g, path),
+    {
+      method: 'PUT',
+      headers: { ...ghHeaders(g), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+    DEFAULT_TIMEOUT_MS,
+    ' GitHub'
+  );
 
   // 409 = sha 对不上（别处改过）；422 有时也是这个意思
   if (r.status === 409 || r.status === 422) {
