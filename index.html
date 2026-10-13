@@ -49,6 +49,7 @@
   .msg.ai .bubble{background:var(--bg2); border:1px solid var(--line); border-bottom-left-radius:5px}
   .msg .imgs{display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end}
   .msg .imgs img{width:88px; height:88px; object-fit:cover; border-radius:10px; border:1px solid var(--line)}
+  .msg .imgs .imggone{width:88px; height:88px; border-radius:10px; border:1px dashed var(--line); display:flex; align-items:center; justify-content:center; text-align:center; font-size:10px; line-height:1.3; color:var(--dim); padding:4px; box-sizing:border-box}
   .thinking{color:var(--dim2); font-size:13px; padding:2px 4px}
   .thinking::after{content:''; animation:dots 1.2s steps(4,end) infinite}
   @keyframes dots{0%{content:''}25%{content:'·'}50%{content:'··'}75%{content:'···'}}
@@ -194,7 +195,7 @@
 <div id="toast"></div>
 
 <script type="module">
-import { runTurn, readJournal, localNow, normalizeBaseUrl, fetchWithTimeout, DEFAULT_TIMEOUT_MS } from './archive-core.js';
+import { runTurn, readJournal, localNow, normalizeBaseUrl, fetchWithTimeout, DEFAULT_TIMEOUT_MS, storageSnapshot } from './archive-core.js';
 
 const $ = (s) => document.querySelector(s);
 const CFG_KEY = 'archive.config.v1';
@@ -233,7 +234,25 @@ function loadSession() {
   } catch {}
 }
 function saveSession() {
-  localStorage.setItem(SES_KEY, JSON.stringify({ turns, lastAt: Date.now() }));
+  // ⚠ 这里原来只是一行 localStorage.setItem，没有任何保护。
+  // 手机上图片的 base64 一超 5 MB 配额就同步抛 QuotaExceededError，
+  // 而 send() 里那个调用不在 try 块内 —— 异常冲出去，
+  // 界面永远停在「在想。。」、runTurn 一次都没跑、刷新后图片消失。
+  // 所以：存之前先剥掉 base64（只留缩略图），并且无论如何都不许抛。
+  try {
+    localStorage.setItem(SES_KEY, JSON.stringify({ ...storageSnapshot(turns), lastAt: Date.now() }));
+  } catch (err) {
+    console.warn('⚠ 会话没存进本地：', err);
+    // 还能救：把图片全丢掉，至少别让整段对话消失
+    try {
+      const textOnly = turns.map((t) => ({ ...t, imgs: undefined, imgCount: t.imgs?.length || undefined }));
+      localStorage.setItem(SES_KEY, JSON.stringify({ turns: textOnly, lastAt: Date.now() }));
+      toast('本地存不下了，这次的图片刷新后会变成占位符（档案在 GitHub 上是好的）', 5000);
+    } catch (err2) {
+      console.warn('⚠ 连文字都存不下：', err2);
+      toast('本地空间不够，刷新后这段对话可能看不到（档案不受影响）', 5000);
+    }
+  }
 }
 function newSession() {
   if (turns.length && !confirm('清掉屏幕上的对话，开新的一段？\n（GitHub 上的档案不受影响）')) return;
@@ -289,10 +308,23 @@ function render() {
     if (t.imgs && t.imgs.length) {
       const wrap = document.createElement('div');
       wrap.className = 'imgs';
-      for (const src of t.imgs) {
-        const im = document.createElement('img');
-        im.src = src;
-        wrap.appendChild(im);
+      for (const im of t.imgs) {
+        // 旧版本存进来的是裸字符串，新版是 {thumb, rel, dataUrl} —— 两种都认
+        const src = typeof im === 'string' ? im : im?.thumb || im?.dataUrl;
+        const rel = typeof im === 'string' ? '' : im?.rel || '';
+        // 只认 data URL。别的东西（比如坏掉的旧记录）会被塞成图片地址，白白报错
+        if (typeof src === 'string' && src.startsWith('data:image/')) {
+          const el = document.createElement('img');
+          el.src = src;
+          wrap.appendChild(el);
+        } else {
+          // 刷新之后大图不再留在本地，只剩仓库里那条路径
+          const ph = document.createElement('div');
+          ph.className = 'imggone';
+          ph.textContent = rel ? '图片已存进仓库' : '图片已发出';
+          ph.title = rel;
+          wrap.appendChild(ph);
+        }
       }
       d.appendChild(wrap);
     }
@@ -363,14 +395,50 @@ function toast(msg, ms = 2400) {
 }
 
 /* ── 图片 ─────────────────────────────── */
+
+// 手机原图动辄 4 MB，base64 之后更大。发之前先压。
+const MAX_EDGE = 1600;
+const JPEG_Q = 0.85;
+const THUMB_EDGE = 128;
+
+function loadImage(src) {
+  return new Promise((res, rej) => {
+    const im = new Image();
+    im.onload = () => res(im);
+    im.onerror = () => rej(new Error('这张图读不出来'));
+    im.src = src;
+  });
+}
+
+/** 读成一个已经缩过、压过的 data URL */
+async function readImageFile(file, maxEdge, quality) {
+  const du = await new Promise((r) => {
+    const fr = new FileReader();
+    fr.onload = () => r(fr.result);
+    fr.readAsDataURL(file);
+  });
+  const im = await loadImage(du);
+  const scale = Math.min(1, maxEdge / Math.max(im.width || 1, im.height || 1));
+  if (scale === 1) return du; // 本来就小，不重编码，免得白掉画质
+  const cv = document.createElement('canvas');
+  cv.width = Math.max(1, Math.round(im.width * scale));
+  cv.height = Math.max(1, Math.round(im.height * scale));
+  const ctx = cv.getContext('2d');
+  // JPEG 没有透明通道，先铺白底，免得 PNG 的透明区域变成黑块
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.drawImage(im, 0, 0, cv.width, cv.height);
+  return cv.toDataURL('image/jpeg', quality);
+}
+
 function renderThumbs() {
   const box = $('#thumbs');
   box.innerHTML = '';
-  pending.forEach((src, i) => {
+  pending.forEach((p, i) => {
     const d = document.createElement('div');
     d.className = 't';
     const im = document.createElement('img');
-    im.src = src;
+    im.src = p.thumb || p.dataUrl;
     const x = document.createElement('button');
     x.className = 'x';
     x.textContent = '×';
@@ -385,12 +453,13 @@ function renderThumbs() {
 $('#btnPhoto').onclick = () => $('#file').click();
 $('#file').onchange = async (e) => {
   for (const f of e.target.files) {
-    const du = await new Promise((r) => {
-      const fr = new FileReader();
-      fr.onload = () => r(fr.result);
-      fr.readAsDataURL(f);
-    });
-    pending.push(du);
+    try {
+      const dataUrl = await readImageFile(f, MAX_EDGE, JPEG_Q);
+      const thumb = await readImageFile(f, THUMB_EDGE, 0.6);
+      pending.push({ dataUrl, thumb });
+    } catch (err) {
+      toast('这张图没读进来：' + err.message);
+    }
   }
   e.target.value = '';
   renderThumbs();
@@ -418,6 +487,8 @@ async function send() {
   const imgs = pending.slice();
   const history = turns.map((t) => ({ role: t.role, text: t.text }));
 
+  // 内存里保留缩略图（给人看）和 dataUrl（用来上传），
+  // 但 saveSession() 会把 dataUrl 剥掉 —— base64 绝不能进 localStorage。
   turns.push({ role: 'user', text, imgs, at: Date.now() });
   pending = [];
   $('#input').value = '';
@@ -428,8 +499,21 @@ async function send() {
   saveSession();
 
   try {
-    const r = await runTurn(cfg, history, { text, images: imgs }, { phase: thinkSay });
+    const r = await runTurn(
+      cfg,
+      history,
+      { text, images: imgs.map((i) => i.dataUrl) },
+      { phase: thinkSay }
+    );
     thinking(false);
+    // 图已经进仓库了：把路径记下来、把大 base64 丢掉，这样刷新也点得开
+    if (r.images?.length) {
+      turns[turns.length - 1].imgs = imgs.map((i, n) => ({
+        rel: r.images[n] || '',
+        thumb: i.thumb,
+        dataUrl: undefined,
+      }));
+    }
     turns.push({ role: 'assistant', text: r.reply || '（没有回复）', updated: r.updated, at: Date.now() });
   } catch (err) {
     thinking(false);

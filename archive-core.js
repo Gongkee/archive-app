@@ -53,8 +53,28 @@ function normalizeBaseUrl(raw) {
 }
 
 /**
- * 每个请求的上限。
+ * 重试时把图片换成一句说明。
  *
+ * 四档重试如果每档都重发完整 base64，一张 4 MB 的图要出网 16 MB，
+ * 手机上一次能等好几分钟 —— 这本身就是「卡在想」的另一个来源。
+ * 图已经进仓库了，把路径告诉模型就够它继续聊。
+ */
+function stripImagesForRetry(messages, imageLines) {
+  const note = imageLines ? `（图片已经存进仓库，但我这次看不到内容：\n${imageLines}）` : '（这次看不到图片内容。）';
+  return messages.map((m) => {
+    if (!Array.isArray(m.content)) return m;
+    const hasImage = m.content.some((p) => p?.type === 'image_url');
+    if (!hasImage) return m;
+    const text = m.content
+      .filter((p) => p?.type === 'text')
+      .map((p) => p.text)
+      .join('\n');
+    return { ...m, content: [text, note].filter(Boolean).join('\n') };
+  });
+}
+
+/**
+ * 每个请求的上限。
  * 这条是拿真实故障换来的：原来所有 fetch 都没有超时，手机发图之后界面就
  * 卡在「在想。。」永远转下去 —— 视觉接口不回、连接半死不活、运营商挂起，
  * 三种情况表现完全一样，而且**四档重试会把整张图的 base64 再发三遍**，
@@ -496,7 +516,7 @@ async function callModel(slot, messages, { json = false, temperature = 0.8, phas
  * 另外：**不是 JSON 不等于没用**。关掉 JSON 模式后模型可能直接说了人话，
  * 那种也要收下（只是这一轮不改档案），不能扔掉。
  */
-async function callUntilUsable(slot, messages, { phase } = {}) {
+async function callUntilUsable(slot, messages, { phase, onRetry } = {}) {
   const NUDGE =
     '（系统提醒：你上一次一个字都没说出来。请重新回答上面那条消息，只输出 JSON。）';
   const MINIMAL =
@@ -517,8 +537,10 @@ async function callUntilUsable(slot, messages, { phase } = {}) {
   for (let i = 0; i < attempts.length; i++) {
     const a = attempts[i];
     let msgs = messages;
+    // 重试时先让调用方有机会换掉昂贵的内容（比如整张图的 base64）
+    if (i > 0 && onRetry) msgs = onRetry(msgs);
     if (a.nudge) msgs = [...msgs, { role: 'user', content: NUDGE }];
-    if (a.minimal) msgs = [{ role: 'system', content: MINIMAL }, messages[messages.length - 1]];
+    if (a.minimal) msgs = [{ role: 'system', content: MINIMAL }, msgs[msgs.length - 1]];
 
     phase?.(i === 0 ? `在问模型（${slot.model}）…` : `第 ${i + 1} 种方式重试中（${a.label}）…`);
 
@@ -676,21 +698,95 @@ async function readJournal(g, { phase } = {}) {
   return { md: f.text, sha: f.sha };
 }
 
+/**
+ * 把 data URL 拆成 `{ mime, b64 }`。
+ *
+ * ⚠ base64 正文里的换行必须先清掉：Canvas 的 toDataURL 一般不换行，但
+ * 别的来源会，而 GitHub 的内容 API 讨厌 `\n`。原来的正则用 `.` 不跨行，
+ * 带换行的数据 URL 会**匹配失败然后被静默丢掉** —— 图片看着"发了"，
+ * 仓库里却没有。
+ */
+function parseDataUrl(du) {
+  const s = String(du || '').trim();
+  const comma = s.indexOf(',');
+  if (comma < 0) return null;
+  const head = /^data:([^;,]+);base64$/i.exec(s.slice(0, comma));
+  if (!head) return null;
+  const b64 = s.slice(comma + 1).replace(/\s+/g, '');
+  if (!b64) return null;
+  return { mime: head[1].toLowerCase(), b64 };
+}
+
 /** 把图片存进同一个仓库的 images/ 下，返回相对路径 */
 async function saveImages(g, dataUrls, { phase } = {}) {
+  const list = dataUrls || [];
   const out = [];
-  for (const du of dataUrls || []) {
-    const m = /^data:([^;,]+);base64,(.+)$/s.exec(String(du || ''));
-    if (!m) continue;
+  for (const du of list) {
+    const parsed = parseDataUrl(du);
+    if (!parsed) {
+      // 不静默：说不清楚是哪一张，就让调用方知道有一张被跳过了
+      throw new Error('有一张图片的格式读不出来（不是标准的 data URL），没有传进仓库');
+    }
     const ext =
-      { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' }[m[1]] || 'jpg';
+      { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' }[parsed.mime] ||
+      'jpg';
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '');
     const name = `images/${stamp}-${Math.random().toString(16).slice(2, 8)}.${ext}`;
-    phase?.(`在把图片传进仓库（${out.length + 1}/${(dataUrls || []).length}）…`);
-    await ghPutB64(g, name, m[2], null, `图片 ${name}`);
+    phase?.(`在把图片传进仓库（${out.length + 1}/${list.length}）…`);
+    await ghPutB64(g, name, parsed.b64, null, `图片 ${name}`);
     out.push({ name, rel: name, dataUrl: du });
   }
   return out;
+}
+
+/**
+ * 会话持久化前的瘦身。
+ *
+ * ⚠ 这条是拿真实故障换来的，别改回去：
+ * 原来 localStorage 直接存整条 turns，而图片是完整 base64 ——
+ * 手机一张原图 base64 就有 4 MB 上下，**5 MB 配额当场爆掉**，
+ * `localStorage.setItem` 同步抛 QuotaExceededError。
+ * 那个调用在 send() 里不在 try 块内，异常直接冲出函数：
+ * 界面永远停在「在想。。」、runTurn 一次都没跑（仓库里当然没有图）、
+ * 刷新后只剩上一次保存的旧会话 —— 三个症状，一个原因。
+ *
+ * 所以：**任何 data URL 都不准进 localStorage**，只留张数、路径和缩略图。
+ */
+const STORAGE_BUDGET = 3 * 1024 * 1024; // 留一半余量，别的页面可能也在用
+
+function storageSnapshot(turns, budget = STORAGE_BUDGET) {
+  let images = null; // 图片全丢了就记一笔，返回给调用方提示
+  const slim = (arr) =>
+    (arr || []).map((t) => {
+      if (!t || typeof t !== 'object') return t;
+      if (t.imgs && t.imgs.length) {
+        images = t.imgs.length;
+        return {
+          role: t.role,
+          text: t.text,
+          at: t.at,
+          updated: t.updated,
+          error: t.error,
+          imgCount: t.imgs.length,
+          thumbs: t.imgs.map((i) => i?.thumb || i?.rel || '').filter(Boolean),
+        };
+      }
+      return t;
+    });
+
+  let out = slim(turns);
+  // 还是太大（对话太长）→ 从最老的开始丢缩略图，文字一条不丢
+  for (let round = 0; round < 4 && JSON.stringify(out).length > budget; round++) {
+    let dropped = false;
+    for (const t of out) {
+      if (t && t.thumbs && t.thumbs.length > 1) {
+        t.thumbs = t.thumbs.slice(-1);
+        dropped = true;
+      }
+    }
+    if (!dropped) break;
+  }
+  return { turns: out, images };
 }
 
 // ═══════════════════════════════════════════════ 一轮对话
@@ -752,9 +848,15 @@ async function runTurn(cfg, history, input, { phase } = {}) {
 
   let r;
   try {
-    r = await callUntilUsable(slot, messages, { phase });
+    r = await callUntilUsable(slot, messages, {
+      phase,
+      // 第 2 档开始不再重发整张图：图已经在仓库里，重发 4 MB×3 次
+      // 只会让手机上多等好几分钟。
+      onRetry: (msgs) => (images.length ? stripImagesForRetry(msgs, imageLines) : msgs),
+    });
   } catch (err) {
-    // 有些视觉接口要的是纯 base64，不带 `data:...;base64,` 前缀。换一种再试一次。
+    // 有些视觉接口要的是**不带** `data:...;base64,` 前缀的纯 base64。
+    // 只在确实调用了视觉接口、而且不是超时的情况下换一种再试一次。
     if (!hasVision || !images.length || err.timeout) throw err;
     console.warn(`⚠ 视觉调用失败：${err.message} —— 换成纯 base64 再试`);
     const bare = messages.map((m) =>
@@ -770,7 +872,10 @@ async function runTurn(cfg, history, input, { phase } = {}) {
         : m
     );
     phase?.('视觉接口没接受标准格式，换纯 base64 再试一次…');
-    r = await callUntilUsable(slot, bare, { phase });
+    r = await callUntilUsable(slot, bare, {
+      phase,
+      onRetry: (msgs) => (images.length ? stripImagesForRetry(msgs, imageLines) : msgs),
+    });
   }
 
   let reply = '';
@@ -816,6 +921,7 @@ async function runTurn(cfg, history, input, { phase } = {}) {
 export {
   MAX_HISTORY,
   DEFAULT_TIMEOUT_MS,
+  STORAGE_BUDGET,
   fetchWithTimeout,
   normalizeBaseUrl,
   applyThinking,
@@ -830,6 +936,9 @@ export {
   localNow,
   readJournal,
   saveImages,
+  parseDataUrl,
+  stripImagesForRetry,
+  storageSnapshot,
   runTurn,
   JOURNAL_HEADER,
   b64ToText,
