@@ -1,0 +1,147 @@
+# 档案
+
+随手说点什么——一句话、一张照片、刚做完的一件事——它接话，然后把值得留下的东西写进**你自己 GitHub 仓库里的一份 markdown**。
+
+**没有服务器。** 手机上的 App 直接跟模型和 GitHub 说话。
+
+```
+        手机上的 App（托管在 GitHub Pages）
+              │
+      ┌───────┴────────┐
+      ▼                ▼
+  DeepSeek/通义      GitHub API
+  （聊天 + 看图）   （读写你的私有仓库）
+```
+
+---
+
+## 一次性设置（十五分钟）
+
+### 1. 建一个**私有**仓库放档案
+
+GitHub → New repository：
+
+- 名字随便，比如 `my-journal`
+- **选 Private**
+- ✅ **勾上 "Add a README file"** ← 别漏，否则仓库没有初始分支，App 第一次写不进去
+
+### 2. 生成访问令牌
+
+GitHub → 右上角头像 → Settings → Developer settings → **Personal access tokens → Fine-grained tokens** → Generate new token：
+
+| 项 | 填什么 |
+|---|---|
+| Repository access | **Only select repositories** → 只勾 `my-journal` |
+| Permissions → Repository permissions → **Contents** | **Read and write** |
+| Expiration | 按你喜好（一年或更久） |
+
+生成后**把那串 `github_pat_...` 复制下来**——它只显示一次。
+
+> ⚠️ 这个令牌只能碰 `my-journal` 这一个仓库，别的什么都动不了。这是故意的。
+
+### 3. 把 App 发到 GitHub
+
+在 `archive-app` 目录里：
+
+```powershell
+git init
+git add .
+git commit -m "档案 App"
+git branch -M main
+git remote add origin https://github.com/<你的用户名>/archive-app.git
+git push -u origin main
+```
+
+（先在 GitHub 上建一个**公开**仓库叫 `archive-app`，别勾 README。）
+
+### 4. 开启 GitHub Pages
+
+那个 App 仓库 → Settings → Pages：
+
+- Source: **Deploy from a branch**
+- Branch: **main** / **/(root)**
+- Save
+
+等一分钟，网址是：
+
+```
+https://<你的用户名>.github.io/archive-app/
+```
+
+### 5. 手机上装
+
+手机浏览器打开上面那个网址 → 点右上角**设置**，填三组东西：
+
+| 组 | 填什么 |
+|---|---|
+| **GitHub** | 令牌（第 2 步那串）、用户名、仓库名 `my-journal`、分支 `main` |
+| **聊天模型** | 接口地址 `https://api.deepseek.com/v1`、模型 `deepseek-chat`、你的 DeepSeek Key |
+| **视觉模型** | 见下面「看图」一节（可以留空） |
+
+保存 → 点**测试连接**，两行都通了就对了。
+
+然后浏览器菜单里选「**添加到主屏幕**」。
+
+**完事。** 以后点桌面上那个图标就能用。
+
+---
+
+## 看图（可选）
+
+第一版**必须**配一个视觉模型，照片才认得出来。**注意智谱不接受网页直连**（没有 CORS），用这几家：
+
+| 提供方 | 接口地址 | 模型名 |
+|---|---|---|
+| 通义 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-vl-max` |
+| 硅基流动 | `https://api.siliconflow.cn/v1` | 看它家模型列表 |
+| 月之暗面 | `https://api.moonshot.cn/v1` | `moonshot-v1-8k-vision-preview` |
+
+不配也能用——照片照样发、照样进仓库，只是 AI 看不到内容，会反过来问你这是什么。
+
+---
+
+## 怎么用
+
+- **打字**：回车发送，Shift+回车换行
+- **发照片**：点左下角 `＋`
+- **看档案**：右上角「看档案」，就是你 GitHub 上那份 markdown
+- **新的一段**：清掉屏幕上的对话（档案不受影响）
+
+聊天记录那段只留在手机浏览器里，超过 90 分钟没动静就自动翻篇——**长期记忆全在那份 markdown 里**。
+
+---
+
+## 出问题了
+
+| 现象 | 原因 |
+|---|---|
+| 「GitHub 令牌无效」 | 令牌过期了，或者在设置里贴错了 |
+| 「找不到仓库或文件」 | 用户名/仓库名写错，或者令牌没勾这个仓库 |
+| 手机打不开网址 | `github.io` 在国内时好时坏。换个网络试试 |
+| 模型报 401 | 模型 Key 不对，或者余额没了 |
+| 模型报跨域错误 | 这家不接受网页直连（智谱就是），换一家 |
+| 聊完没写进档案 | 模型判断这条不值得记。直接说「把这个记下来」 |
+
+---
+
+## 关于花费和记录
+
+- 每聊一次 = 一次 GitHub 提交。用久了仓库历史会比较长——**这是好事**，你能看到自己的档案是怎么一天天长起来的。
+- 模型费用自理。DeepSeek 很便宜，还有 prompt 缓存。
+- **App 代码是公开的，你的档案是私有的。** 两者不在一个仓库里，令牌和 Key 只存在你手机本地。
+
+---
+
+## 开发
+
+```powershell
+node test.mjs          # 35 项，网络全部 mock 掉
+node make-icons.mjs    # 重新生成图标
+```
+
+`archive-core.js` 是全部逻辑（浏览器和 Node 通用）。里面有**两处是拿真实故障换来的**，注释写了原因，改之前先看：
+
+- `MAX_HISTORY` / `buildMessages()` —— 对话历史的格式和长度，实测能把记录率从 3/14 拉到 13/14
+- `callUntilUsable()` —— 模型吐空白或吐 JSON 残渣时的兜底
+
+改完跑 `node test.mjs`。**别靠肉眼验。**
