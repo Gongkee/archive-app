@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 档案核心的回归测试。跑这个，不要靠肉眼。
  *
  *   node test.mjs
@@ -913,6 +913,18 @@ check('manifest 是合法 JSON，图标文件存在', () => {
   for (const ic of mf.icons) {
     assert.ok(existsSync(new URL('./' + ic.src, import.meta.url)), `图标不存在：${ic.src}`);
   }
+});
+
+check('文本文件不能带 UTF-8 BOM（会让 manifest 解析失败、PWA 装不上）', () => {
+  // 真踩过：用 PowerShell 的 Set-Content -Encoding utf8 改文件会悄悄加 BOM。
+  // HTML 和 .mjs 忍得了，但 manifest.webmanifest 是 JSON —— 浏览器直接解析失败。
+  const files = ['index.html', 'archive-core.js', 'manifest.webmanifest', 'sw.js', 'test.mjs'];
+  const bad = [];
+  for (const f of files) {
+    const buf = readFileSync(new URL('./' + f, import.meta.url));
+    if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) bad.push(f);
+  }
+  assert.strictEqual(bad.length, 0, '这些文件带了 BOM：' + bad.join('、'));
 });
 
 // ═══════════════════════════════ 会话持久化（手机发大图卡死的现场）

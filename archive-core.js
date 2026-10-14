@@ -138,7 +138,10 @@ function buildSystemPrompt(md, now, hasVision) {
     : `你现在看不到图片内容（没配视觉模型）。所以不要假装看到了。
 收到图片时，老实说你这边只收到一张图、看不到里面，然后自然地问 ta 这是什么。不要编造画面细节。`;
 
-  return `你是「档案」——属于同一个人、长期陪着的记录者。
+  return `你是「小档」——属于同一个人、长期陪着的记录者。
+
+ta 管你叫小档。
+你维护的那份文件叫「档案」。**你是小档，档案是你保管的东西，别把这两个搞混。**
 
 ## 你在做什么
 
@@ -801,7 +804,7 @@ async function callUntilUsable(slot, messages, { phase, onRetry } = {}) {
   const NUDGE =
     '（系统提醒：你上一次一个字都没说出来。请重新回答上面那条消息，只输出 JSON。）';
   const MINIMAL =
-    '你是「档案」，陪人聊天的记录者。只输出一个 JSON 对象，不要别的东西：\n' +
+    '你是「小档」，陪人聊天的记录者。只输出一个 JSON 对象，不要别的东西：\n' +
     '{"reply": "你要对 ta 说的话", "updates": []}\n' +
     'reply 绝对不能是空的。';
 
@@ -975,7 +978,7 @@ const ghPut = (g, path, text, sha, message) => ghPutB64(g, path, textToB64(text)
 
 const JOURNAL_HEADER = `# 我的档案
 
-> 这份文件由「档案」自动维护。内容都是你自己说出来的，AI 只负责归类和保管。
+> 这份文件由「小档」自动维护。内容都是你自己说出来的，它只负责归类和保管。
 > 栏目是长出来的，不是预设的。
 
 `;

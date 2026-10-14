@@ -1,7 +1,7 @@
 {
-  "name": "档案",
-  "short_name": "档案",
-  "description": "随手说点什么，AI 接话并归进你自己 GitHub 仓库里的一份 markdown",
+  "name": "小档",
+  "short_name": "小档",
+  "description": "小档：随手说点什么，它接话、追问，然后归进你自己 GitHub 仓库里的一份 markdown",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
