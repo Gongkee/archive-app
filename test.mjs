@@ -22,6 +22,7 @@ import {
   parseModelJSON,
   salvageReply,
   replaceSection,
+  removeSection,
   runTurn,
   localNow,
   parseDataUrl,
@@ -152,6 +153,39 @@ check('剥掉中间标题后，后面的真栏目不会被卷进去', () => {
 });
 
 // ═══════════════════════════════ 历史拼装
+
+console.log('\n── 删栏目（合并重复时必须用）──');
+
+check('能整个删掉一个栏目', () => {
+  let md = replaceSection(HEAD, '心情', '| a |');
+  md = replaceSection(md, '工作', '| b |');
+  md = removeSection(md, '心情');
+  assert.strictEqual(countH2(md, '心情'), 0);
+  assert.strictEqual(countH2(md, '工作'), 1, '不该误删别的栏目');
+  assert.ok(md.includes('| b |'));
+});
+
+check('删栏目不会误伤同名的三级小节', () => {
+  let md = replaceSection(HEAD, '身体', '### 睡眠\n| 6小时 |');
+  md = replaceSection(md, '睡眠', '| 10-13 | 6小时 |');
+  md = removeSection(md, '睡眠');
+  assert.strictEqual(countH2(md, '睡眠'), 0, '顶层「睡眠」没删掉');
+  assert.ok(/### 睡眠/.test(md), '身体下面的「### 睡眠」小节被误删了');
+  assert.ok(md.includes('| 6小时 |'));
+});
+
+check('删最后一个栏目不会吃掉前面的内容', () => {
+  let md = replaceSection(HEAD, '心情', '| a |');
+  md = replaceSection(md, '工作', '| b |');
+  md = removeSection(md, '工作');
+  assert.ok(md.includes('| a |'), '前面栏目的内容丢了');
+  assert.strictEqual(countH2(md, '工作'), 0);
+});
+
+check('删不存在的栏目 = 原样不动', () => {
+  const md = replaceSection(HEAD, '心情', '| a |');
+  assert.strictEqual(removeSection(md, '根本没有'), md);
+});
 
 console.log('\n── 对话历史拼装 ──');
 
@@ -286,6 +320,44 @@ await checkAsync('已有档案 → 带上 sha 更新，旧内容不丢', async (
   assert.ok(written.includes('开了四小时会'), '新内容没写进去');
   assert.strictEqual(countH2(written, '心情'), 1);
   assert.strictEqual(countH2(written, '工作'), 1);
+});
+
+await checkAsync('合并重复栏目：改内容 + 删多余，一轮真的做完（真实踩过）', async () => {
+  const before =
+    HEAD +
+    '## 身体\n\n### 睡眠\n| 10-13 | 6小时 |\n\n' +
+    '## 睡眠\n\n| 10-13 | 6小时 |\n| 10-14 | 7小时 |\n\n' +
+    '## 工作\n\n| 加班 |\n';
+  const puts = [];
+  installFetch([
+    (u, m) => (u.includes('/contents/journal.md') && m === 'GET' ? jsonRes(200, { content: textToB64(before), sha: 's' }) : null),
+    (u, m, b) => {
+      if (u.includes('/contents/journal.md') && m === 'PUT') {
+        puts.push(b);
+        return jsonRes(200, { content: { sha: 'n' } });
+      }
+      return null;
+    },
+    (u) =>
+      u.includes('/chat/completions')
+        ? modelSays({
+            reply: '合并好了。',
+            updates: [
+              { section: '身体', content: '### 睡眠\n| 10-13 | 6小时 |\n| 10-14 | 7小时 |' },
+              { section: '睡眠', delete: true },
+            ],
+          })
+        : null,
+  ]);
+
+  const r = await runTurn(CFG, [], { text: '合并', images: [] });
+  assert.strictEqual(r.updated, true, '说了合并就必须真的写进去');
+  const after = b64ToText(puts[0].content);
+  assert.strictEqual(countH2(after, '睡眠'), 0, '顶层「睡眠」没被删掉');
+  assert.strictEqual(countH2(after, '身体'), 1);
+  assert.ok(after.includes('7小时'), '合并后的内容没带上');
+  assert.ok(after.includes('| 加班 |'), '工作栏目被误删');
+  assert.ok(/### 睡眠/.test(after), '身体下面的小节被误删了');
 });
 
 await checkAsync('档案在别处被改过 → 自动重读重放，两边内容都保住', async () => {

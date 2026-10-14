@@ -252,6 +252,19 @@ ${visionNote}
   \`content\` 只写正文，小节用三级标题。
 - 一次最多更新两个栏目。
 
+### 要删掉一个栏目，用这个
+
+\`\`\`json
+{ "section": "栏目名", "delete": true }
+\`\`\`
+
+**合并重复栏目时必须用它。** 正确的两步是：
+
+1. 把两个栏目的内容并起来，用 \`content\` 写进要保留的那个
+2. 用 \`delete: true\` 把多余的那个删掉
+
+**只改内容不删，重复的栏目还在。** 删不掉就说明白，不要假装删了。
+
 ## 什么值得记
 
 **判断标准不是"这件事够不够重要"，而是"这是不是一个可以说清楚的事实"。**
@@ -302,16 +315,28 @@ ta 可能永远不补那句话，这条就从档案里消失了。
 如果 \`updates\` 是空的，就**绝对不要**说这种话——那是在骗 ta，
 而且 ta 会以为已经记上了、以后再也想不起来要补。
 
-**同样地：不要预告你要做什么。**
+**这是条原则，不是一张词表 —— 别去找别的说法绕过去。**
 
-- ✗ 「我把它们合并一下」—— 说完就没动静了，ta 只能干等着
-- ✗ 「我来整理一下」「稍后补上」—— 全是空话
-- ✓ 这一轮就在 \`updates\` 里改完，然后说「合了」
+**任何关于「档案变了」的话，都必须以这一轮 \`updates\` 里真的改了东西为前提。**
 
-**要改就这一轮改完，改不了就别说。中间态的话一句都不要说。**
+不管是完成时、进行时还是将来时：
+
+- ✗ 「记下了」「存好了」「已归到身体下面了」
+- ✗ 「合并好了」「整理完了」「重复的已经去掉了」
+- ✗ 「我把它们合并一下」「我这就改」「稍后补上」
+
+只要这一轮的 \`updates\` 是空的（或者 \`delete\` 没真的删掉东西），
+**上面这些一个字都不许说。**
+
+做不到就老实说做不到，别报个假的完成。
+
+**问句是允许的** —— 「要我现在把它们合并掉吗？」这种征求意见没问题。
+但 ta 一旦说"要"，下一轮你就**必须真的动手**。
+
+**要改就这一轮改完，改不了就直说改不了。中间态和假完成，一个字都不要说。**
 
 ta 问"有没有重复"这种关于档案本身的问题时，正确做法是：
-**先在这一轮的 \`updates\` 里真的把它改好，然后在 reply 里说改了什么。**
+**先在这一轮的 \`updates\` 里真的改好，然后才在 reply 里说改了什么。**
 
 大多数时候你根本不用提"记"这个字，自然接话就行。
 
@@ -481,6 +506,27 @@ function replaceSection(md, name, content) {
   const end = nextRel === -1 ? md.length : afterHeader + nextRel;
 
   return md.slice(0, afterHeader) + '\n\n' + body + '\n\n' + md.slice(end).replace(/^\n+/, '');
+}
+
+/**
+ * 整个删掉一个栏目。
+ *
+ * ⚠ 这个函数不能没有。模型合并重复栏目时要做的事是「把内容并进 A，再删掉 B」，
+ * 而原来的 updates 只能改和建、**不能删** —— 它做不到，于是嘴上说「合并好了」，
+ * 档案一个字没动。给它删的能力，它就不用撒谎了。
+ */
+function removeSection(md, name) {
+  const re = new RegExp(`^##[ \\t]+${escapeRe(name)}[ \\t]*$`, 'm');
+  const m = re.exec(md);
+  if (!m) return md;
+
+  const afterHeader = m.index + m[0].length;
+  const rest = md.slice(afterHeader);
+  const nextRel = rest.search(/^##[ \t]+/m);
+  const end = nextRel === -1 ? md.length : afterHeader + nextRel;
+
+  const joined = md.slice(0, m.index) + md.slice(end);
+  return joined.replace(/\n{3,}/g, '\n\n').replace(/[ \t]+$/, '').replace(/\s*$/, '') + '\n';
 }
 
 async function callModel(slot, messages, { json = false, temperature = 0.8, phase } = {}) {
@@ -944,9 +990,15 @@ async function runTurn(cfg, history, input, { phase } = {}) {
       for (let attempt = 0; attempt < 3; attempt++) {
         let next = md;
         for (const u of updates) {
-          if (!u || !u.section || typeof u.content !== 'string') continue;
-          const name = String(u.section).trim().replace(/^#+\s*/, '');
+          if (!u || typeof u !== 'object') continue;
+          const name = String(u.section || '').trim().replace(/^#+\s*/, '');
           if (!name) continue;
+          // 删除：合并重复栏目时必须用它，光靠改内容是删不掉的
+          if (u.delete === true) {
+            next = removeSection(next, name);
+            continue;
+          }
+          if (typeof u.content !== 'string') continue;
           next = replaceSection(next, name, u.content);
         }
         if (next === md) break;
@@ -985,6 +1037,7 @@ export {
   parseModelJSON,
   salvageReply,
   replaceSection,
+  removeSection,
   callModel,
   callUntilUsable,
   localNow,
