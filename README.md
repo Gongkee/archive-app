@@ -135,13 +135,24 @@ https://<你的用户名>.github.io/archive-app/
 ## 开发
 
 ```powershell
-node test.mjs          # 35 项，网络全部 mock 掉
+node test.mjs          # 44 项，网络全部 mock 掉
 node make-icons.mjs    # 重新生成图标
 ```
 
-`archive-core.js` 是全部逻辑（浏览器和 Node 通用）。里面有**两处是拿真实故障换来的**，注释写了原因，改之前先看：
+`archive-core.js` 是全部逻辑（浏览器和 Node 通用）。里面有**几处是拿真实故障换来的**，
+注释写了原因，改之前先看：
 
 - `MAX_HISTORY` / `buildMessages()` —— 对话历史的格式和长度，实测能把记录率从 3/14 拉到 13/14
+- `stripSectionHeading()` —— 正文里混进 `## 标题` 会长出重复栏目，必须**全部**剥掉，不能只剥开头的
 - `callUntilUsable()` —— 模型吐空白或吐 JSON 残渣时的兜底
 
 改完跑 `node test.mjs`。**别靠肉眼验。**
+
+### 档案已经长了重复栏目怎么办
+
+```powershell
+node fix-journal.mjs journal.md
+```
+
+它写出 `journal.md.fixed.md`（**不覆盖原文件**），把重名栏目合到一起、去掉完全重复的行。
+看一眼确认没问题，再自己替换。

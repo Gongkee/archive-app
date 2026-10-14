@@ -9,6 +9,7 @@
 import assert from 'node:assert';
 import { readFileSync, existsSync } from 'node:fs';
 import * as core from './archive-core.js';
+import { mergeDuplicateSections } from './fix-journal.mjs';
 import {
   MAX_HISTORY,
   buildMessages,
@@ -122,6 +123,23 @@ check('多个栏目交织更新，顺序和数量都稳', () => {
 check('三级标题不会被误当成栏目', () => {
   const md = replaceSection(HEAD, '身体', '### 体重\n| 150斤 |');
   assert.strictEqual(countH2(md, '体重'), 0);
+});
+
+check('正文中间的 ## 标题必须剥掉（重复栏目就是这么来的）', () => {
+  let md = replaceSection(HEAD, '身体', '### 体重\n| 150斤 |');
+  // 模型把别的栏目标题写进了正文中间 —— 以前只剥开头的，这个会漏过去
+  md = replaceSection(md, '身体', '### 体重\n| 151斤 |\n\n## 睡眠\n| 6小时 |');
+  assert.strictEqual(countH2(md, '睡眠'), 0, '凭空长出了一个「睡眠」栏目');
+  assert.strictEqual(countH2(md, '身体'), 1);
+  assert.ok(md.includes('| 6小时 |'), '内容不该丢，只是那个标题该被剥掉');
+});
+
+check('剥掉中间标题后，后面的真栏目不会被卷进去', () => {
+  let md = replaceSection(HEAD, '身体', '| a |');
+  md = replaceSection(md, '工作', '| b |');
+  md = replaceSection(md, '身体', '| a2 |\n\n## 心情\n| c |');
+  assert.strictEqual(countH2(md, '工作'), 1, '工作栏目被那个假标题吞掉了');
+  assert.ok(md.includes('| b |'), '工作栏目的内容丢了');
 });
 
 // ═══════════════════════════════ 历史拼装
@@ -433,6 +451,74 @@ check('localNow 的格式', () => {
   assert.strictEqual(n.time, '09:05');
   assert.ok(n.text.includes('2026-10-13'));
   assert.ok(n.text.includes('周二'));
+});
+
+console.log('\n── 修档案（合并重复栏目）──');
+
+const DUP = `# 我的档案
+
+> 说明
+
+## 睡眠
+
+| 日期 | 时长 |
+|---|---|
+| 10-13 | 6小时 |
+
+## 宠物
+
+| 日期 | 记录 |
+|---|---|
+| 10-13 | 猫来了 |
+
+## 睡眠
+
+| 日期 | 时长 |
+|---|---|
+| 10-13 | 6小时 |
+| 10-14 | 7小时 |
+
+## 工作
+
+| 日期 | 记录 |
+|---|---|
+| 10-14 | 加班 |
+`;
+
+check('重名的栏目被合成一个', () => {
+  const r = mergeDuplicateSections(DUP);
+  assert.strictEqual(countH2(r.md, '睡眠'), 1, '睡眠还是重复的');
+  assert.deepStrictEqual(r.merged, ['睡眠']);
+  assert.strictEqual(r.uniqueSections, 3);
+});
+
+check('合并后重复的表头和行被去掉，新内容保留', () => {
+  const { md } = mergeDuplicateSections(DUP);
+  assert.ok(md.includes('7小时'), '新内容丢了');
+  assert.strictEqual((md.match(/\| 10-13 \| 6小时 \|/g) || []).length, 1, '重复的行没去掉');
+});
+
+check('其它栏目一个字不动', () => {
+  const { md } = mergeDuplicateSections(DUP);
+  assert.ok(md.includes('| 10-13 | 猫来了 |'), '宠物栏目内容丢了');
+  assert.ok(md.includes('| 10-14 | 加班 |'), '工作栏目内容丢了');
+  assert.ok(md.startsWith('# 我的档案'), '文件头丢了');
+  assert.ok(md.includes('> 说明'));
+});
+
+check('没有重复时，内容原样返回', () => {
+  const clean = HEAD + '## 心情\n\n| 日期 | 记录 |\n|---|---|\n| 10-14 | 还行 |\n';
+  const r = mergeDuplicateSections(clean);
+  assert.deepStrictEqual(r.merged, []);
+  assert.ok(r.md.includes('| 10-14 | 还行 |'));
+  assert.strictEqual(countH2(r.md, '心情'), 1);
+});
+
+check('重复三次也能合成一个', () => {
+  const md = HEAD + '## 心情\n\n| a |\n\n## 心情\n\n| b |\n\n## 心情\n\n| c |\n';
+  const r = mergeDuplicateSections(md);
+  assert.strictEqual(countH2(r.md, '心情'), 1);
+  for (const v of ['| a |', '| b |', '| c |']) assert.ok(r.md.includes(v), v + ' 丢了');
 });
 
 console.log('\n── 文件与引用 ──');
