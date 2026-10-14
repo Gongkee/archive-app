@@ -522,6 +522,21 @@ await checkAsync('图片会先存进 GitHub，路径再交给模型', async () =
   assert.ok(userMsg.content.some((p) => p.type === 'image_url'), '图片没带上');
 });
 
+await checkAsync('模型用别的字段表达删除时，必须留下痕迹而不是闷掉（真实踩过）', async () => {
+  installFetch([
+    (u, m) => (u.includes('/contents/journal.md') && m === 'GET' ? jsonRes(200, { content: textToB64(HEAD), sha: 's' }) : null),
+    (u) =>
+      u.includes('/chat/completions')
+        ? modelSays({ reply: '合并好了。', updates: [{ section: '睡眠', action: 'delete' }] })
+        : null,
+  ]);
+
+  const r = await runTurn(CFG, [], { text: '合并', images: [] });
+  assert.strictEqual(r.updated, false, '这条本来就没法执行，不该说写成功了');
+  assert.strictEqual(r.skippedUpdates.length, 1, '看不懂的更新必须被记下来，否则以后查都没法查');
+  assert.ok(/睡眠/.test(r.skippedUpdates[0]), '要指出是哪一条：' + r.skippedUpdates[0]);
+});
+
 await checkAsync('视觉栏留空 → 图片自动交给聊天模型', async () => {
   const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
   let sent = null;

@@ -985,21 +985,37 @@ async function runTurn(cfg, history, input, { phase } = {}) {
   // 之前这里是直接 throw 的，结果档案写不进去的时候连 AI 说的话都丢了。
   let updated = false;
   let writeError = null;
+  let skippedUpdates = [];
   if (updates.length) {
     try {
       for (let attempt = 0; attempt < 3; attempt++) {
         let next = md;
+        skippedUpdates = [];
         for (const u of updates) {
-          if (!u || typeof u !== 'object') continue;
+          if (!u || typeof u !== 'object') {
+            skippedUpdates.push(String(u).slice(0, 60));
+            continue;
+          }
           const name = String(u.section || '').trim().replace(/^#+\s*/, '');
-          if (!name) continue;
+          if (!name) {
+            skippedUpdates.push(JSON.stringify(u).slice(0, 80));
+            continue;
+          }
           // 删除：合并重复栏目时必须用它，光靠改内容是删不掉的
           if (u.delete === true) {
             next = removeSection(next, name);
             continue;
           }
-          if (typeof u.content !== 'string') continue;
+          if (typeof u.content !== 'string') {
+            // ⚠ 不要静默跳过。以前这里直接 continue，模型用别的字段表达删除时
+            // 整条被吞掉，外面看起来就是「说了要改，档案却没动」，查都没法查。
+            skippedUpdates.push(`「${name}」既没有 content，也没有 delete 标记`);
+            continue;
+          }
           next = replaceSection(next, name, u.content);
+        }
+        if (skippedUpdates.length) {
+          console.warn(`  ⚠ 有 ${skippedUpdates.length} 条更新看不懂，已跳过：${skippedUpdates.join('；')}`);
         }
         if (next === md) break;
         try {
@@ -1021,7 +1037,13 @@ async function runTurn(cfg, history, input, { phase } = {}) {
     }
   }
 
-  return { reply, updated, writeError, images: images.map((i) => i.rel).filter(Boolean) };
+  return {
+    reply,
+    updated,
+    writeError,
+    skippedUpdates,
+    images: images.map((i) => i.rel).filter(Boolean),
+  };
 }
 
 export {
