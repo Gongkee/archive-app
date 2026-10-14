@@ -3,12 +3,122 @@
  *
  * 浏览器和 Node 都能跑：不碰文件系统，存储走 GitHub API，模型走 fetch。
  *
- * 这个文件里有两处是拿真实故障换来的，**改之前先看注释**：
+ * 这个文件里有三处是拿真实故障换来的，**改之前先看注释**：
  *   - MAX_HISTORY / buildMessages()  —— 历史格式和历史长度
  *   - callUntilUsable()              —— 模型吐空白/吐残渣时的兜底
+ *   - fetchWithTimeout / DEFAULT_TIMEOUT_MS —— 请求永远不返回时的死等
  */
 
 const endpoint = (baseUrl) => baseUrl.replace(/\/+$/, '') + '/chat/completions';
+
+/**
+ * 是不是 DeepSeek 的接口（只有它认 `thinking` 这个参数）。
+ *
+ * ⚠ 必须锚定到主机名结尾：不锚的话 `api.deepseek.com.evil.com` 也会判成 true，
+ * 然后我们会给一个陌生域名发 `thinking` —— 非标准参数，对面可能直接 400。
+ * 前面的边界也要留：`notdeepseek.com` 不能算。
+ */
+const DEEPSEEK_HOST = /(?:^|[./])deepseek\.com(?:[:/]|$)/i;
+const isDeepSeek = (baseUrl) => DEEPSEEK_HOST.test(String(baseUrl || ''));
+
+/**
+ * 关掉 DeepSeek 的思考模式。
+ *
+ * 这条也是拿真实故障换来的：DeepSeek **默认打开思考模式，且 effort 默认 high**，
+ * 模型会先吐一整段 `reasoning_content` 再吐正文。这个 App 只读 `message.content`，
+ * 思维链那段时间一个字都收不到 —— 手机上就是「在想。。」一直转，看图尤其明显。
+ *
+ * 注意：`thinking` 不是标准 OpenAI 参数，发给别家（通义、月之暗面等）可能直接 400，
+ * 所以只对 DeepSeek 的域名发。想恢复思考模式：把 disabled 改成 enabled。
+ */
+function applyThinking(body, baseUrl) {
+  if (isDeepSeek(baseUrl)) body.thinking = { type: 'disabled' };
+  return body;
+}
+
+/**
+ * 把常见的接口地址写法归一。
+ *
+ * `https://api.deepseek.com` 和 `https://api.deepseek.com/v1` 官方都认，
+ * 但 README 和各家 SDK 写的都是带 `/v1` 的那个，统一成它少踩坑。
+ * 已经带路径的（`.../compatible-mode/v1`）原样保留。
+ */
+function normalizeBaseUrl(raw) {
+  const s = String(raw || '').trim().replace(/\/+$/, '');
+  if (!s) return '';
+  if (/^https?:\/\/(api\.)?deepseek\.com$/i.test(s)) {
+    return s + '/v1';
+  }
+  return s;
+}
+
+/**
+ * 重试时把图片换成一句说明。
+ *
+ * 四档重试如果每档都重发完整 base64，一张 4 MB 的图要出网 16 MB，
+ * 手机上一次能等好几分钟 —— 这本身就是「卡在想」的另一个来源。
+ * 图已经进仓库了，把路径告诉模型就够它继续聊。
+ */
+function stripImagesForRetry(messages, imageLines) {
+  const note = imageLines ? `（图片已经存进仓库，但我这次看不到内容：\n${imageLines}）` : '（这次看不到图片内容。）';
+  return messages.map((m) => {
+    if (!Array.isArray(m.content)) return m;
+    const hasImage = m.content.some((p) => p?.type === 'image_url');
+    if (!hasImage) return m;
+    const text = m.content
+      .filter((p) => p?.type === 'text')
+      .map((p) => p.text)
+      .join('\n');
+    return { ...m, content: [text, note].filter(Boolean).join('\n') };
+  });
+}
+
+
+/**
+ * 带超时、并且会报清楚「是谁连不上」的 fetch。
+ *
+ * 两件事都拿真实故障换来过：
+ *
+ * 1. **没有超时就会永远卡住**。原来一个超时都没有，手机发图之后界面就
+ *    卡在「在想。。」永远转下去 —— 视觉接口不回、连接半死不活、运营商挂起，
+ *    三种情况表现完全一样。宁可等到 150 秒报一句明确的「超时」。
+ *    150 秒是给「看图」留的余量：图片比纯文字慢，再叠上模型侧排队，
+ *    90 秒实测偏紧，会把本来能成功的一次误报成超时。
+ *
+ * 2. **网络层失败必须说清是谁**。`fetch` 拨不通时抛的是 TypeError，
+ *    message 只有 Safari 的「Load failed」或 Chrome 的「Failed to fetch」
+ *    —— 用户看到的就这一句，分不出是 GitHub 还是模型接口。所以用 label
+ *    把服务名和主机名（**不含 key**）挂在前面。
+ *
+ * 浏览器和 Node 都有 AbortController，不需要额外依赖。
+ */
+const DEFAULT_TIMEOUT_MS = 150000;
+
+async function fetchWithTimeout(url, opts = {}, timeoutMs = DEFAULT_TIMEOUT_MS, label = '') {
+  const ctl = new AbortController();
+  const ms = Number(timeoutMs) > 0 ? Number(timeoutMs) : DEFAULT_TIMEOUT_MS;
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: ctl.signal });
+  } catch (err) {
+    // abort 在浏览器里是 AbortError，Node 里是自己抛的 InvalidStateError
+    if (ctl.signal.aborted) {
+      const e = new Error(`请求超过 ${Math.round(ms / 1000)} 秒没有响应（网络或者接口卡住了）`);
+      e.timeout = true;
+      throw e;
+    }
+    // 网络层失败：把「是谁」补上，别只留一句 Load failed
+    let host = '';
+    try {
+      host = new URL(String(url)).host;
+    } catch {}
+    const e = new Error(`连不上${label}${host ? '（' + host + '）' : ''}：${err?.message || err}`);
+    e.cause = err;
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** 现在的本地时间（给人看的字符串 + 给模型用的字段） */
 function localNow(d = new Date()) {
@@ -373,7 +483,7 @@ function replaceSection(md, name, content) {
   return md.slice(0, afterHeader) + '\n\n' + body + '\n\n' + md.slice(end).replace(/^\n+/, '');
 }
 
-async function callModel(slot, messages, { json = false, temperature = 0.8 } = {}) {
+async function callModel(slot, messages, { json = false, temperature = 0.8, phase } = {}) {
   if (!slot.apiKey || !slot.baseUrl || !slot.model) {
     throw new Error('模型槽位没配好（baseUrl / apiKey / model 缺一个）');
   }
@@ -383,15 +493,23 @@ async function callModel(slot, messages, { json = false, temperature = 0.8 } = {
     temperature,
   };
   if (json) body.response_format = { type: 'json_object' };
+  applyThinking(body, slot.baseUrl);
 
-  const res = await fetch(endpoint(slot.baseUrl), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${slot.apiKey}`,
+  const t0 = Date.now();
+  const res = await fetchWithTimeout(
+    endpoint(slot.baseUrl),
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${slot.apiKey}`,
+      },
+      body: JSON.stringify(body),
     },
-    body: JSON.stringify(body),
-  });
+    DEFAULT_TIMEOUT_MS,
+    `模型接口（${slot.model}）`
+  );
+  phase?.(`模型回应了 · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
   const text = await res.text();
   if (!res.ok) {
@@ -424,7 +542,7 @@ async function callModel(slot, messages, { json = false, temperature = 0.8 } = {
  * 另外：**不是 JSON 不等于没用**。关掉 JSON 模式后模型可能直接说了人话，
  * 那种也要收下（只是这一轮不改档案），不能扔掉。
  */
-async function callUntilUsable(slot, messages) {
+async function callUntilUsable(slot, messages, { phase, onRetry } = {}) {
   const NUDGE =
     '（系统提醒：你上一次一个字都没说出来。请重新回答上面那条消息，只输出 JSON。）';
   const MINIMAL =
@@ -445,10 +563,14 @@ async function callUntilUsable(slot, messages) {
   for (let i = 0; i < attempts.length; i++) {
     const a = attempts[i];
     let msgs = messages;
+    // 重试时先让调用方有机会换掉昂贵的内容（比如整张图的 base64）
+    if (i > 0 && onRetry) msgs = onRetry(msgs);
     if (a.nudge) msgs = [...msgs, { role: 'user', content: NUDGE }];
-    if (a.minimal) msgs = [{ role: 'system', content: MINIMAL }, messages[messages.length - 1]];
+    if (a.minimal) msgs = [{ role: 'system', content: MINIMAL }, msgs[msgs.length - 1]];
 
-    const r = await callModel(slot, msgs, { json: a.json, temperature: a.temperature });
+    phase?.(i === 0 ? `在问模型（${slot.model}）…` : `第 ${i + 1} 种方式重试中（${a.label}）…`);
+
+    const r = await callModel(slot, msgs, { json: a.json, temperature: a.temperature, phase });
     const parsed = parseModelJSON(r.content);
 
     // reply 本身也必须像句人话 —— 实测出现过模型把 '{' 当成回复
@@ -551,10 +673,13 @@ function ghExplain(status, body) {
 }
 
 async function ghGet(g, path) {
-  const r = await fetch(`${ghUrl(g, path)}?ref=${encodeURIComponent(g.branch || 'main')}`, {
-    headers: ghHeaders(g),
-    cache: 'no-store',
-  });
+  const url = `${ghUrl(g, path)}?ref=${encodeURIComponent(g.branch || 'main')}`;
+  const r = await fetchWithTimeout(
+    url,
+    { headers: ghHeaders(g), cache: 'no-store' },
+    DEFAULT_TIMEOUT_MS,
+    ' GitHub'
+  );
   if (r.status === 404) return null;
   if (!r.ok) throw new Error(ghExplain(r.status, await r.text()));
   const j = await r.json();
@@ -569,11 +694,16 @@ async function ghPutB64(g, path, base64Content, sha, message) {
   const body = { message, content: base64Content, branch: g.branch || 'main' };
   if (sha) body.sha = sha;
 
-  const r = await fetch(ghUrl(g, path), {
-    method: 'PUT',
-    headers: { ...ghHeaders(g), 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  const r = await fetchWithTimeout(
+    ghUrl(g, path),
+    {
+      method: 'PUT',
+      headers: { ...ghHeaders(g), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+    DEFAULT_TIMEOUT_MS,
+    ' GitHub'
+  );
 
   // 409 = sha 对不上（别处改过）；422 有时也是这个意思
   if (r.status === 409 || r.status === 422) {
@@ -595,24 +725,50 @@ const JOURNAL_HEADER = `# 我的档案
 
 `;
 
-async function readJournal(g) {
+async function readJournal(g, { phase } = {}) {
+  phase?.('在读 GitHub 上的档案…');
   const f = await ghGet(g, g.journalPath || 'journal.md');
   if (!f) return { md: JOURNAL_HEADER, sha: null };
   return { md: f.text, sha: f.sha };
 }
 
+/**
+ * 把 data URL 拆成 `{ mime, b64 }`。
+ *
+ * ⚠ base64 正文里的换行必须先清掉：Canvas 的 toDataURL 一般不换行，但
+ * 别的来源会，而 GitHub 的内容 API 讨厌 `\n`。原来的正则用 `.` 不跨行，
+ * 带换行的数据 URL 会**匹配失败然后被静默丢掉** —— 图片看着"发了"，
+ * 仓库里却没有。
+ */
+function parseDataUrl(du) {
+  const s = String(du || '').trim();
+  const comma = s.indexOf(',');
+  if (comma < 0) return null;
+  const head = /^data:([^;,]+);base64$/i.exec(s.slice(0, comma));
+  if (!head) return null;
+  const b64 = s.slice(comma + 1).replace(/\s+/g, '');
+  if (!b64) return null;
+  return { mime: head[1].toLowerCase(), b64 };
+}
+
 /** 把图片存进同一个仓库的 images/ 下，返回相对路径 */
-async function saveImages(g, dataUrls) {
+async function saveImages(g, dataUrls, { phase } = {}) {
+  const list = dataUrls || [];
   const out = [];
-  for (const du of dataUrls || []) {
-    const m = /^data:([^;,]+);base64,(.+)$/s.exec(String(du || ''));
-    if (!m) continue;
+  for (const du of list) {
+    const parsed = parseDataUrl(du);
+    if (!parsed) {
+      // 不静默：说不清楚是哪一张，就让调用方知道有一张被跳过了
+      throw new Error('有一张图片的格式读不出来（不是标准的 data URL），没有传进仓库');
+    }
     const ext =
-      { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' }[m[1]] || 'jpg';
+      { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' }[parsed.mime] ||
+      'jpg';
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '');
     const name = `images/${stamp}-${Math.random().toString(16).slice(2, 8)}.${ext}`;
+    phase?.(`在把图片传进仓库（${out.length + 1}/${list.length}）…`);
     try {
-      await ghPutB64(g, name, m[2], null, `图片 ${name}`);
+      await ghPutB64(g, name, parsed.b64, null, `图片 ${name}`);
       out.push({ name, rel: name, dataUrl: du });
     } catch (err) {
       // 图片没存上不能拖垮整轮：模型还是能用 data URL 看到它，
@@ -624,20 +780,81 @@ async function saveImages(g, dataUrls) {
   return out;
 }
 
+/**
+ * 会话持久化前的瘦身。
+ *
+ * ⚠ 这条是拿真实故障换来的，别改回去：
+ * 原来 localStorage 直接存整条 turns，而图片是完整 base64 ——
+ * 手机一张原图 base64 就有 4 MB 上下，**5 MB 配额当场爆掉**，
+ * `localStorage.setItem` 同步抛 QuotaExceededError。
+ * 那个调用在 send() 里不在 try 块内，异常直接冲出函数：
+ * 界面永远停在「在想。。」、runTurn 一次都没跑（仓库里当然没有图）、
+ * 刷新后只剩上一次保存的旧会话 —— 三个症状，一个原因。
+ *
+ * 所以：**任何 data URL 都不准进 localStorage**，只留张数、路径和缩略图。
+ */
+const STORAGE_BUDGET = 3 * 1024 * 1024; // 留一半余量，别的页面可能也在用
+
+function storageSnapshot(turns, budget = STORAGE_BUDGET) {
+  let images = null; // 图片全丢了就记一笔，返回给调用方提示
+  const slim = (arr) =>
+    (arr || []).map((t) => {
+      if (!t || typeof t !== 'object') return t;
+      if (t.imgs && t.imgs.length) {
+        images = t.imgs.length;
+        return {
+          role: t.role,
+          text: t.text,
+          at: t.at,
+          updated: t.updated,
+          error: t.error,
+          imgCount: t.imgs.length,
+          thumbs: t.imgs.map((i) => i?.thumb || i?.rel || '').filter(Boolean),
+        };
+      }
+      return t;
+    });
+
+  let out = slim(turns);
+  // 还是太大（对话太长）→ 从最老的开始丢缩略图，文字一条不丢
+  for (let round = 0; round < 4 && JSON.stringify(out).length > budget; round++) {
+    let dropped = false;
+    for (const t of out) {
+      if (t && t.thumbs && t.thumbs.length > 1) {
+        t.thumbs = t.thumbs.slice(-1);
+        dropped = true;
+      }
+    }
+    if (!dropped) break;
+  }
+  return { turns: out, images };
+}
+
 // ═══════════════════════════════════════════════ 一轮对话
 
 /**
  * 读档案 → 问模型 → 写回档案。
+ * @param {object} [opts] - opts.phase(text) 用来给界面报当前进行到哪一步了
  * @returns {Promise<{reply:string, updated:boolean, images:string[]}>}
  */
-async function runTurn(cfg, history, input) {
+async function runTurn(cfg, history, input, { phase } = {}) {
   const g = cfg.github;
   const now = localNow();
 
-  let { md, sha } = await readJournal(g);
+  let { md, sha } = await readJournal(g, { phase });
 
-  const images = await saveImages(g, input?.images || []);
-  const hasVision = Boolean(cfg.vision?.apiKey && cfg.vision?.baseUrl && cfg.vision?.model);
+  const images = await saveImages(g, input?.images || [], { phase });
+  /**
+   * 留空 = 用聊天模型。
+   *
+   * 同厂家的多模态模型（比如 deepseek-flash）本身就能看图，再填一遍纯属重复劳动，
+   * 而且两栏填不一致时会出现「文字走 A、图片走 B」的怪现象。
+   * 三栏都填了才用视觉槽位，否则回退到聊天槽位。
+   */
+  const visionCfg =
+    cfg.vision?.apiKey && cfg.vision?.baseUrl && cfg.vision?.model ? cfg.vision : cfg.chat;
+  const hasVision = Boolean(visionCfg?.apiKey && visionCfg?.baseUrl && visionCfg?.model);
+  const visionIsOwnSlot = visionCfg === cfg.vision;
 
   const userText = String(input?.text || '').trim();
   // 只有真的存上去了才给它路径 —— 否则模型会往档案里写一条死链
@@ -661,15 +878,31 @@ async function runTurn(cfg, history, input) {
     userContent = bits.join('\n\n') || '（空消息）';
   }
 
-  const slot = hasVision && images.length ? cfg.vision : cfg.chat;
+  const slot = hasVision && images.length ? visionCfg : cfg.chat;
   const messages = buildMessages(buildSystemPrompt(md, now.text, hasVision), history, userContent);
+
+  if (images.length) {
+    phase?.(
+      hasVision
+        ? `在问视觉模型（${visionCfg.model}）${visionIsOwnSlot ? '' : ' · 视觉栏留空，用的聊天模型'}…`
+        : '没配视觉模型，只能问它这是什么…'
+    );
+  } else {
+    phase?.('在想…');
+  }
 
   let r;
   try {
-    r = await callUntilUsable(slot, messages);
+    r = await callUntilUsable(slot, messages, {
+      phase,
+      // 第 2 档开始不再重发整张图：图已经在仓库里，重发 4 MB×3 次
+      // 只会让手机上多等好几分钟。
+      onRetry: (msgs) => (images.length ? stripImagesForRetry(msgs, imageLines) : msgs),
+    });
   } catch (err) {
-    // 有些视觉接口要的是纯 base64，不带 `data:...;base64,` 前缀。换一种再试一次。
-    if (!hasVision || !images.length) throw err;
+    // 有些视觉接口要的是**不带** `data:...;base64,` 前缀的纯 base64。
+    // 只在确实调用了视觉接口、而且不是超时的情况下换一种再试一次。
+    if (!hasVision || !images.length || err.timeout) throw err;
     console.warn(`⚠ 视觉调用失败：${err.message} —— 换成纯 base64 再试`);
     const bare = messages.map((m) =>
       Array.isArray(m.content)
@@ -683,7 +916,11 @@ async function runTurn(cfg, history, input) {
           }
         : m
     );
-    r = await callUntilUsable(slot, bare);
+    phase?.('视觉接口没接受标准格式，换纯 base64 再试一次…');
+    r = await callUntilUsable(slot, bare, {
+      phase,
+      onRetry: (msgs) => (images.length ? stripImagesForRetry(msgs, imageLines) : msgs),
+    });
   }
 
   let reply = '';
@@ -714,6 +951,7 @@ async function runTurn(cfg, history, input) {
         }
         if (next === md) break;
         try {
+          phase?.('在把这一条写进档案…');
           await ghPut(g, g.journalPath || 'journal.md', next, sha, `档案更新 ${now.text}`);
           updated = true;
           break;
@@ -736,6 +974,12 @@ async function runTurn(cfg, history, input) {
 
 export {
   MAX_HISTORY,
+  DEFAULT_TIMEOUT_MS,
+  STORAGE_BUDGET,
+  fetchWithTimeout,
+  normalizeBaseUrl,
+  applyThinking,
+  isDeepSeek,
   buildSystemPrompt,
   buildMessages,
   parseModelJSON,
@@ -746,6 +990,9 @@ export {
   localNow,
   readJournal,
   saveImages,
+  parseDataUrl,
+  stripImagesForRetry,
+  storageSnapshot,
   runTurn,
   JOURNAL_HEADER,
   b64ToText,

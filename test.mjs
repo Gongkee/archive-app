@@ -12,12 +12,21 @@ import * as core from './archive-core.js';
 import { mergeDuplicateSections } from './fix-journal.mjs';
 import {
   MAX_HISTORY,
+  DEFAULT_TIMEOUT_MS,
+  STORAGE_BUDGET,
+  fetchWithTimeout,
+  normalizeBaseUrl,
+  applyThinking,
+  isDeepSeek,
   buildMessages,
   parseModelJSON,
   salvageReply,
   replaceSection,
   runTurn,
   localNow,
+  parseDataUrl,
+  stripImagesForRetry,
+  storageSnapshot,
   b64ToText,
   textToB64,
 } from './archive-core.js';
@@ -441,6 +450,203 @@ await checkAsync('图片会先存进 GitHub，路径再交给模型', async () =
   assert.ok(userMsg.content.some((p) => p.type === 'image_url'), '图片没带上');
 });
 
+await checkAsync('视觉栏留空 → 图片自动交给聊天模型', async () => {
+  const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  let sent = null;
+  installFetch([
+    (u, m) => (m === 'GET' ? jsonRes(200, { content: textToB64(HEAD), sha: 's1' }) : null),
+    (u, m, b) => {
+      if (u.includes('/contents/images/') && m === 'PUT') return jsonRes(200, { content: { sha: 'x' } });
+      if (u.includes('/contents/journal.md') && m === 'PUT') return jsonRes(200, { content: { sha: 's2' } });
+      return null;
+    },
+    (u, m, b) => {
+      if (u.includes('/chat/completions')) {
+        sent = b;
+        return modelSays({ reply: '看到了', updates: [] });
+      }
+      return null;
+    },
+  ]);
+
+  // vision 三栏全空（test.mjs 的 CFG 本来就是空的），只有聊天模型
+  const r = await runTurn(CFG, [], { text: '', images: [png] });
+  assert.strictEqual(r.reply, '看到了');
+  assert.ok(sent, '没发出模型请求');
+  assert.strictEqual(sent.model, 'm', '应该用聊天模型');
+  const last = sent.messages.at(-1);
+  assert.ok(Array.isArray(last.content), '留空时图片也必须以数组形式发出去');
+  assert.ok(last.content.some((p) => p.type === 'image_url'), '留空时图片没带上');
+});
+
+// ═══════════════════════════════ 超时
+console.log('\n── 超时（不给超时就会永远卡在「在想。。」）──');
+
+await checkAsync('接口不回时，fetchWithTimeout 会明确超时，不会死等', async () => {
+  const real = globalThis.fetch;
+  // 模拟半死不活的连接：既不响应，也不报错
+  globalThis.fetch = (url, opts = {}) =>
+    new Promise((_, reject) => {
+      opts.signal?.addEventListener('abort', () => {
+        const e = new Error('aborted');
+        e.name = 'AbortError';
+        reject(e);
+      });
+    });
+  try {
+    await assert.rejects(
+      () => fetchWithTimeout('https://api.example.com/v1/chat/completions', {}, 40),
+      (err) => {
+        assert.ok(err.timeout, '超时错误应该带 timeout 标记');
+        assert.match(err.message, /40 秒|没有响应/);
+        return true;
+      }
+    );
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+await checkAsync('正常响应照常返回，超时器不会误伤', async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => 'ok' });
+  try {
+    const r = await fetchWithTimeout('https://api.example.com/x', {}, 500);
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(await r.text(), 'ok');
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+check('默认超时是一个有限的正数', () => {
+  assert.ok(Number.isFinite(DEFAULT_TIMEOUT_MS), '默认超时必须是有限数字，否则等于没超时');
+  assert.ok(DEFAULT_TIMEOUT_MS > 0 && DEFAULT_TIMEOUT_MS <= 300000);
+});
+
+// 手机上报错只给一句「Load failed」，分不出是 GitHub 还是模型挂了 —— 必须说清是谁
+console.log('\n── 拨不通的时候要说清是谁 ──');
+
+const deadFetch = (name) => {
+  const real = globalThis.fetch;
+  globalThis.fetch = () => {
+    const e = new TypeError(name);
+    return Promise.reject(e);
+  };
+  return () => {
+    globalThis.fetch = real;
+  };
+};
+
+await checkAsync('拨不通时带上标签和主机名，不再只有一句 Load failed', async () => {
+  const restore = deadFetch('Load failed');
+  try {
+    await assert.rejects(
+      () => fetchWithTimeout('https://api.example.com/v1/chat/completions', {}, 500, '模型接口（m）'),
+      (err) => {
+        assert.ok(!err.timeout, '这不是超时，别标成超时');
+        assert.match(err.message, /连不上模型接口（m）/);
+        assert.match(err.message, /api\.example\.com/, '得带上主机名，不然还是不知道连的谁');
+        assert.match(err.message, /Load failed/, '原始信息不能丢');
+        return true;
+      }
+    );
+  } finally {
+    restore();
+  }
+});
+
+await checkAsync('runTurn 里模型拨不通 → 报的是模型，不是 GitHub', async () => {
+  const restore = deadFetch('Load failed');
+  try {
+    // GitHub 走通，只有模型接口拨不通
+    globalThis.fetch = (u) =>
+      String(u).includes('github.com')
+        ? Promise.resolve(jsonRes(200, { content: textToB64(HEAD), sha: 's' }))
+        : Promise.reject(new TypeError('Load failed'));
+    await assert.rejects(() => runTurn(CFG, [], { text: '你好', images: [] }), (err) => {
+      assert.match(err.message, /连不上模型接口/, '应该指出是模型接口：' + err.message);
+      assert.ok(!/GitHub/.test(err.message), '别冤枉 GitHub：' + err.message);
+      return true;
+    });
+  } finally {
+    restore();
+  }
+});
+
+await checkAsync('GitHub 拨不通 → 报的是 GitHub', async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = (u) => {
+    if (String(u).includes('github.com')) return Promise.reject(new TypeError('Load failed'));
+    return Promise.resolve(jsonRes(200, { choices: [{ message: { content: '{}' } }], usage: {} }));
+  };
+  try {
+    await assert.rejects(() => runTurn(CFG, [], { text: '你好', images: [] }), (err) => {
+      assert.match(err.message, /连不上 GitHub/, '应该指出是 GitHub：' + err.message);
+      return true;
+    });
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+check('核心逻辑里只有一处 fetch，且必须带超时（裸 fetch 会死等）', () => {
+  const src = readFileSync(new URL('./archive-core.js', import.meta.url), 'utf8');
+  // 数**所有** fetch 调用。以前用 lookbehind 排除 `.fetch(`，结果
+  // `() => fetch(` 也被一起排除了 —— 断言是绿的，但漏了真的裸 fetch。
+  const all = [...src.matchAll(/\bfetch\s*\(/g)].map((m) => m.index);
+  // 唯一允许的那一处，必须在 fetchWithTimeout 里面
+  const decl = src.search(/(?:async\s+)?function\s+fetchWithTimeout\b/);
+  assert.ok(decl >= 0, '找不到 fetchWithTimeout');
+  const bodyStart = src.indexOf('{', decl);
+  const bodyEnd = src.indexOf('\n}', bodyStart);
+  assert.ok(bodyStart > 0 && bodyEnd > bodyStart, 'fetchWithTimeout 的函数体没解析出来');
+
+  const outside = all.filter((i) => i < bodyStart || i > bodyEnd);
+  assert.strictEqual(
+    outside.length,
+    0,
+    `fetchWithTimeout 之外还有 ${outside.length} 处 fetch：` +
+      outside.map((i) => JSON.stringify(src.slice(i - 40, i + 30))).join(' | ')
+  );
+  assert.strictEqual(all.length, 1, `整个文件应该只有一处 fetch，实际 ${all.length} 处`);
+});
+
+check('DeepSeek 关掉思考模式（否则只读 content 会一直转圈）', () => {
+  const b = applyThinking({ model: 'deepseek-flash' }, 'https://api.deepseek.com/v1');
+  assert.deepStrictEqual(b.thinking, { type: 'disabled' });
+});
+
+check('别家厂商不发 thinking 参数（非标准参数会 400）', () => {
+  const other = applyThinking(
+    { model: 'qwen-vl-max' },
+    'https://dashscope.aliyuncs.com/compatible-mode/v1'
+  );
+  assert.ok(!('thinking' in other), '给通义发了 thinking 参数，可能直接 400');
+});
+
+check('正确识别 DeepSeek 域名', () => {
+  assert.ok(isDeepSeek('https://api.deepseek.com'));
+  assert.ok(isDeepSeek('https://api.deepseek.com/v1'));
+  assert.ok(isDeepSeek('https://deepseek.com/v1'), '不带 api. 前缀的也要认');
+  assert.ok(isDeepSeek('https://api.deepseek.com:443/v1'), '带端口也要认');
+  assert.ok(!isDeepSeek('https://api.deepseek.com.evil.com/v1'), '域名后缀不能误判');
+  assert.ok(!isDeepSeek('https://notdeepseek.com/v1'), '前缀边界不能误判');
+  assert.ok(!isDeepSeek('https://api.moonshot.cn/v1'));
+  assert.ok(!isDeepSeek(''));
+});
+
+check('接口地址归一：deepseek 补上 /v1，其它原样', () => {
+  assert.strictEqual(normalizeBaseUrl('https://api.deepseek.com'), 'https://api.deepseek.com/v1');
+  assert.strictEqual(normalizeBaseUrl('https://api.deepseek.com/'), 'https://api.deepseek.com/v1');
+  assert.strictEqual(normalizeBaseUrl('https://api.deepseek.com/v1'), 'https://api.deepseek.com/v1');
+  assert.strictEqual(
+    normalizeBaseUrl('https://dashscope.aliyuncs.com/compatible-mode/v1'),
+    'https://dashscope.aliyuncs.com/compatible-mode/v1'
+  );
+  assert.strictEqual(normalizeBaseUrl('  '), '');
+});
+
 // ═══════════════════════════════ 时间
 
 console.log('\n── 时间 ──');
@@ -568,6 +774,177 @@ check('manifest 是合法 JSON，图标文件存在', () => {
   assert.strictEqual(mf.display, 'standalone');
   for (const ic of mf.icons) {
     assert.ok(existsSync(new URL('./' + ic.src, import.meta.url)), `图标不存在：${ic.src}`);
+  }
+});
+
+// ═══════════════════════════════ 会话持久化（手机发大图卡死的现场）
+
+console.log('\n── 会话持久化（base64 绝不能进 localStorage）──');
+
+const BIG = 'data:image/jpeg;base64,' + 'A'.repeat(5 * 1024 * 1024); // 一张 5 MB 的假图
+
+check('持久化时必须剥掉整张 base64', () => {
+  const s = storageSnapshot([{ role: 'user', text: '看看', at: 1, imgs: [{ dataUrl: BIG, thumb: 'data:image/jpeg;base64,AAA' }] }]);
+  const raw = JSON.stringify(s);
+  assert.ok(!raw.includes('AAAA'.repeat(10)), '大 base64 混进去了');
+  assert.ok(!raw.includes(BIG.slice(0, 200)), 'dataUrl 没被剥掉');
+  assert.ok(raw.length < 2000, `瘦身后的会话还是太大：${raw.length} 字节`);
+});
+
+check('剥掉大图之后仍然知道有几张图、缩略图还在', () => {
+  const s = storageSnapshot([
+    { role: 'user', text: '', at: 1, imgs: [{ dataUrl: BIG, thumb: 'data:image/jpeg;base64,T1' }, { dataUrl: BIG, thumb: 'data:image/jpeg;base64,T2' }] },
+  ]);
+  const t = s.turns[0];
+  assert.strictEqual(t.imgCount, 2, '张数丢了，刷新后连"有几张图"都不知道');
+  assert.deepStrictEqual(t.thumbs, ['data:image/jpeg;base64,T1', 'data:image/jpeg;base64,T2']);
+  assert.strictEqual(t.imgs, undefined, 'imgs 不该留在持久化结果里');
+  assert.strictEqual(t.text, '');
+  assert.strictEqual(t.role, 'user');
+});
+
+check('一张 5 MB 的图，瘦身后必须远小于配额（这就是当初炸掉的原因）', () => {
+  const before = JSON.stringify({ turns: [{ role: 'user', imgs: [{ dataUrl: BIG }] }] }).length;
+  const after = JSON.stringify(storageSnapshot([{ role: 'user', imgs: [{ dataUrl: BIG, thumb: 'x' }] }])).length;
+  assert.ok(before > 5 * 1024 * 1024, '造的数据不够大，这个测试就没意义了');
+  assert.ok(after < STORAGE_BUDGET / 10, `瘦身后 ${after} 字节，还是太大`);
+});
+
+check('对话太长时优先丢缩略图，文字一条都不能丢', () => {
+  const turns = [];
+  for (let i = 0; i < 40; i++) {
+    turns.push({ role: 'user', text: '第' + i + '句', at: i, imgs: [{ dataUrl: BIG, thumb: 'T'.repeat(50) + i }] });
+  }
+  const s = storageSnapshot(turns, 20 * 1024);
+  assert.strictEqual(s.turns.length, 40, '文字条目被丢了');
+  for (const t of s.turns) assert.ok(typeof t.text === 'string' && t.text.startsWith('第'), '文字丢了');
+  assert.ok(JSON.stringify(s).length < 60 * 1024, '还是没收进预算');
+});
+
+check('没有图片的普通对话原样保留', () => {
+  const s = storageSnapshot([{ role: 'user', text: '在吗', at: 1 }, { role: 'assistant', text: '在的。', at: 2 }]);
+  assert.deepStrictEqual(s.turns.map((t) => t.text), ['在吗', '在的。']);
+  assert.strictEqual(s.images, null);
+});
+
+// ═══════════════════════════════ 图片解析
+
+console.log('\n── 图片 data URL 解析 ──');
+
+const ONE_PX = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+
+check('标准 data URL 能拆开', () => {
+  const p = parseDataUrl(`data:image/png;base64,${ONE_PX}`);
+  assert.strictEqual(p.mime, 'image/png');
+  assert.strictEqual(p.b64, ONE_PX);
+});
+
+check('base64 里有换行也要认（原来会被静默丢掉，图就"发丢"了）', () => {
+  const wrapped = ONE_PX.slice(0, 20) + '\n' + ONE_PX.slice(20);
+  const p = parseDataUrl(`data:image/jpeg;base64,${wrapped}`);
+  assert.ok(p, '带换行的 data URL 没解析出来');
+  assert.strictEqual(p.b64, ONE_PX, '换行没被清掉');
+});
+
+check('不是 data URL 就返回 null，不要装作成功', () => {
+  assert.strictEqual(parseDataUrl(''), null);
+  assert.strictEqual(parseDataUrl('https://example.com/a.png'), null);
+  assert.strictEqual(parseDataUrl('data:image/png;base64,'), null);
+  assert.strictEqual(parseDataUrl('data:image/png,abc'), null, '没有 base64 标记的不能当图片');
+});
+
+await checkAsync('格式坏的图片要报错，不能静默跳过', async () => {
+  installFetch([(u, m) => (m === 'GET' ? jsonRes(404, { message: 'Not Found' }) : null)]);
+  await assert.rejects(
+    () => runTurn(CFG, [], { text: '看图', images: ['这不是图片'] }),
+    /格式读不出来/
+  );
+});
+
+// ═══════════════════════════════ 重试不复传大图
+
+console.log('\n── 重试不复传大图 ──');
+
+check('重试时图片被换成一句说明，base64 不再出网', () => {
+  const msgs = [
+    { role: 'system', content: 'SYS' },
+    { role: 'user', content: [{ type: 'text', text: '这是什么' }, { type: 'image_url', image_url: { url: BIG } }] },
+  ];
+  const once = stripImagesForRetry(msgs, 'images/a.jpg');
+  const raw = JSON.stringify(once);
+  assert.ok(!raw.includes('AAAA'.repeat(10)), '重试时还在发整张图');
+  assert.ok(raw.includes('images/a.jpg'), '路径应该留给模型');
+  assert.ok(raw.includes('这是什么'), '原来的文字不能丢');
+  assert.strictEqual(once[0].content, 'SYS', '纯文字的系统消息不该被动');
+});
+
+check('没有图片的消息原样返回', () => {
+  const msgs = [{ role: 'user', content: '普通文字' }];
+  assert.deepStrictEqual(stripImagesForRetry(msgs), msgs);
+});
+
+await checkAsync('图片调用失败重试时，第二次不再重发 base64', async () => {
+  const sizes = [];
+  let n = 0;
+  installFetch([
+    (u, m) => (m === 'GET' ? jsonRes(200, { content: textToB64(HEAD), sha: 's' }) : null),
+    (u, m) => (u.includes('/contents/images/') && m === 'PUT' ? jsonRes(200, { content: { sha: 'x' } }) : null),
+    (u, m, b) => {
+      if (!u.includes('/chat/completions')) return null;
+      n++;
+      sizes.push(JSON.stringify(b).length);
+      // 第一次故意失败（非超时），逼它走重试
+      if (n === 1) return jsonRes(400, { error: { message: 'bad image format' } });
+      return modelSays({ reply: '看到了', updates: [] });
+    },
+  ]);
+
+  const big = 'data:image/png;base64,' + ONE_PX + 'A'.repeat(4000);
+  const cfgV = { ...CFG, vision: { baseUrl: 'https://v.example.com/v1', apiKey: 'vk', model: 'vm' } };
+  const r = await runTurn(cfgV, [], { text: '看看', images: [big] });
+  assert.strictEqual(r.reply, '看到了');
+  assert.ok(sizes.length >= 2, '应该重试过');
+  assert.ok(sizes[1] < sizes[0], `重试的请求没变小：${sizes[0]} → ${sizes[1]}`);
+});
+
+// ═══════════════════════════════ 前端不许再犯同样的错
+
+console.log('\n── 前端防线（index.html 源码约束）──');
+
+check('saveSession 有 try/catch —— 配额爆了不许拖垮整个 send()', () => {
+  const m = html.match(/function saveSession\(\)\s*\{([\s\S]*?)\n\}/);
+  assert.ok(m, '没找到 saveSession');
+  assert.ok(/try\s*\{/.test(m[1]), 'saveSession 里没有 try —— 手机配额一爆界面就卡死');
+  assert.ok(/catch/.test(m[1]), 'saveSession 里没有 catch');
+});
+
+check('localStorage 只存瘦身后的会话，绝不直接存 turns', () => {
+  const sets = [...html.matchAll(/localStorage\.setItem\(([^;]*)\)/g)];
+  assert.ok(sets.length > 0);
+  for (const s of sets) {
+    const arg = s[1];
+    assert.ok(
+      !/JSON\.stringify\(\s*\{\s*turns\s*,/.test(arg),
+      '又把裸 turns 存进 localStorage 了：' + arg.slice(0, 80)
+    );
+  }
+  assert.ok(/storageSnapshot\(/.test(html), 'saveSession 应该走 storageSnapshot 瘦身');
+});
+
+check('发图之前必须先压缩（手机原图直接用会把配额撑爆）', () => {
+  assert.ok(/MAX_EDGE/.test(html) && /readImageFile/.test(html), '图片没有压缩这一步');
+  const m = html.match(/async function readImageFile\([^)]*\)\s*\{([\s\S]*?)\n\}/);
+  assert.ok(m, '没找到 readImageFile');
+  assert.ok(/toDataURL\(/.test(m[1]), '压缩后没有重新编码');
+  assert.ok(/scale|Math\.min/.test(m[1]), '没有缩放计算');
+});
+
+check('会话瘦身后不留 dataUrl 字段给 localStorage', () => {
+  const s = storageSnapshot([{ role: 'user', imgs: [{ dataUrl: 'data:image/png;base64,' + 'B'.repeat(100000), thumb: 'T' }] }]);
+  for (const t of s.turns) {
+    for (const v of Object.values(t)) {
+      assert.ok(!String(v).includes('BBBBBBBB'), '还有字段带着大 base64');
+    }
   }
 });
 
