@@ -250,7 +250,10 @@ ${visionNote}
   **绝对不要弄丢已有记录。**
 - \`content\` 里**不要写 \`## 栏目名\` 这个标题**。栏目名已经由 \`section\` 字段指明了。
   \`content\` 只写正文，小节用三级标题。
-- 一次最多更新两个栏目。
+- **平时记录，一次最多改两个栏目**（怕你顺手把整份档案重写一遍）。
+- ⚠ **整理、合并、去重的时候不受这个限制。** 该改几个改几个、该删就删，
+  **一次做完**。分几次做只会做一半，然后留下一个没做完的档案。
+  合并一对重复栏目通常需要三四个操作（改 A、改 B、删 A、删 B），这是正常的。
 
 ### 要删掉一个栏目，用这个
 
@@ -497,7 +500,9 @@ function replaceSection(md, name, content) {
   const m = re.exec(md);
 
   if (!m) {
-    return md.replace(/\s*$/, '') + `\n\n## ${name}\n\n${body}\n`;
+    // 新建：先把可能残留的同名栏目清干净，再追加 —— 保证全局只有一个
+    const cleaned = dedupeSection(md, name).md;
+    return cleaned.replace(/\s*$/, '') + `\n\n## ${name}\n\n${body}\n`;
   }
 
   const afterHeader = m.index + m[0].length;
@@ -505,7 +510,8 @@ function replaceSection(md, name, content) {
   const nextRel = rest.search(/^##[ \t]+/m);
   const end = nextRel === -1 ? md.length : afterHeader + nextRel;
 
-  return md.slice(0, afterHeader) + '\n\n' + body + '\n\n' + md.slice(end).replace(/^\n+/, '');
+  const out = md.slice(0, afterHeader) + '\n\n' + body + '\n\n' + md.slice(end).replace(/^\n+/, '');
+  return dedupeSection(out, name).md;
 }
 
 /**
@@ -527,6 +533,159 @@ function removeSection(md, name) {
 
   const joined = md.slice(0, m.index) + md.slice(end);
   return joined.replace(/\n{3,}/g, '\n\n').replace(/[ \t]+$/, '').replace(/\s*$/, '') + '\n';
+}
+
+/**
+ * 同名栏目只留一个：把后面重复的栏目**并进第一个**，然后删掉那些重复的壳。
+ *
+ * ⚠ 必须是「合并」，不能是「直接删」。
+ * 一开始我写的是直接删掉第二个 —— 结果第二个栏目里有、而模型这次没写的行
+ * 就跟着一起没了。实测拿真模型跑，3 次里丢了 2 次内容（"又看见那只狗"那条）。
+ * **去重可以少一条，但不能少一条真的记录。**
+ *
+ * ⚠ 为什么写档案时要顺手做：
+ * `replaceSection` 只替换**第一个**匹配。模型写 `[改] 宠物` 的时候，
+ * 它以为"改了宠物"就等于"只剩一个宠物"，于是第二个原封不动留着，
+ * 它照样在 reply 里说「整理好了」。实测 3 次里有 2 次是这样。
+ */
+function dedupeSection(md, name) {
+  const one = new RegExp(`^##[ \\t]+${escapeRe(name)}[ \\t]*$`);
+  const lines = md.split('\n');
+  const hits = [];
+  for (let i = 0; i < lines.length; i++) if (one.test(lines[i].trim())) hits.push(i);
+  if (hits.length <= 1) return { md, removed: 0 };
+
+  const bodyStart = hits[0] + 1;
+  let bodyEnd = bodyStart;
+  while (bodyEnd < lines.length && !/^##(?!#)/.test(lines[bodyEnd].trim())) bodyEnd++;
+
+  // 第一个栏目的原文
+  const kept = lines.slice(bodyStart, bodyEnd);
+  const seen = new Set(kept.map((l) => l.trim()).filter(Boolean));
+
+  // 后面每个重复栏目里的行：整行没见过的，并进来；见过的丢掉
+  const extras = [];
+  const skip = new Set();
+  for (let i = bodyStart; i < bodyEnd; i++) skip.add(i);
+  for (let k = 1; k < hits.length; k++) {
+    let end = hits[k] + 1;
+    while (end < lines.length && !/^##(?!#)/.test(lines[end].trim())) end++;
+    for (let i = hits[k]; i < end; i++) {
+      skip.add(i);
+      // ⚠ 标题那一行绝对不能并进正文 —— 并进去就等于又造了一个重复栏目。
+      // 这个坑我踩过：合并「宠物」之后还是两个「宠物」。
+      if (i === hits[k]) continue;
+      const t = lines[i].trim();
+      if (!t || seen.has(t)) continue;
+      seen.add(t);
+      extras.push(lines[i]);
+    }
+  }
+
+  const merged = [...kept, ...extras];
+  while (merged.length && !merged[merged.length - 1].trim()) merged.pop();
+
+  const outLines = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (i === bodyStart) outLines.push(...merged);
+    if (skip.has(i)) continue;
+    outLines.push(lines[i]);
+  }
+
+  const out = outLines.join('\n').replace(/\n{3,}/g, '\n\n').replace(/\s*$/, '') + '\n';
+  return { md: out, removed: hits.length - 1, mergedLines: extras.length };
+}
+
+/**
+ * 把模型给的 updates 应用到档案上。
+ *
+ * ⚠ 抽出来是为了让测试跑的是**同一份逻辑**，不是抄一份。
+ * 之前验证脚本自己抄了一遍，我加了全篇去重之后脚本没跟上，
+ * 结果「验证通过」是假的 —— 测的根本不是线上那段代码。
+ *
+ * @returns {{md: string, skipped: string[]}}
+ */
+function applyUpdates(md, updates) {
+  let next = md;
+  const skipped = [];
+
+  const clean = (s) => String(s || '').trim().replace(/^#+\s*/, '');
+
+  // 这一轮写了内容的栏目名。删除操作要给它们让路（见下）
+  const written = new Set(
+    updates.filter((u) => u && typeof u.content === 'string' && clean(u.section)).map((u) => clean(u.section))
+  );
+
+  for (const u of updates) {
+    if (!u || typeof u !== 'object') {
+      skipped.push(String(u).slice(0, 60));
+      continue;
+    }
+    const name = clean(u.section);
+    if (!name) {
+      skipped.push(JSON.stringify(u).slice(0, 80));
+      continue;
+    }
+    // 删除：合并重复栏目时要用它，光靠改内容是删不掉的
+    if (u.delete === true) {
+      /**
+       * ⚠ 同一个栏目这一轮**又写了内容**时，删除必须让路。
+       *
+       * 模型表达「宠物重复了，合成一个」的方式是同时给出
+       * `{section:'宠物', content:...}` 和 `{section:'宠物', delete:true}`。
+       * 而 removeSection 删的是**第一个** —— 如果删除排在写之前，
+       * 后面那次写就会去覆盖剩下那个（含更多记录的），把内容弄丢。
+       * 实测 3 次里丢 2 次。
+       *
+       * 写赢。真正的重复交给 dedupeAllSections 去并。
+       */
+      if (written.has(name)) continue;
+      next = removeSection(next, name);
+      continue;
+    }
+    if (typeof u.content !== 'string') {
+      // ⚠ 不要静默跳过。以前这里直接 continue，模型用别的字段表达删除时
+      // 整条被吞掉，外面看起来就是「说了要改，档案却没动」，查都没法查。
+      skipped.push(`「${name}」既没有 content，也没有 delete 标记`);
+      continue;
+    }
+    next = replaceSection(next, name, u.content);
+  }
+
+  // 全篇清一遍重复栏目 —— 跟模型这轮碰没碰过它们无关
+  next = dedupeAllSections(next).md;
+  return { md: next, skipped };
+}
+
+/**
+ * 全篇扫一遍，把所有同名栏目并成一个。
+ *
+ * ⚠ 光靠 replaceSection 里那一下不够：模型这轮要是没碰某个重复栏目，
+ * 就不会触发去重。实测「整理重复栏目」三次里有两次模型压根没写『宠物』，
+ * 于是那一对重复就原地留着 —— 而它照样说「整理好了」。
+ * 所以每次写完档案都全篇扫一遍，跟模型碰没碰过无关。
+ */
+function dedupeAllSections(md) {
+  const names = [...md.matchAll(/^##[ \t]+(.+?)[ \t]*$/gm)].map((m) => m[1]);
+  const count = new Map();
+  for (const n of names) count.set(n, (count.get(n) || 0) + 1);
+
+  let out = md;
+  let removed = 0;
+  const merged = [];
+  for (const [n, c] of count) {
+    if (c < 2) continue;
+    const r = dedupeSection(out, n);
+    if (r.removed) {
+      out = r.md;
+      removed += r.removed;
+      merged.push(n);
+    }
+  }
+  if (merged.length) {
+    console.warn(`  ⚠ 档案里有重复栏目（${merged.join('、')}），已自动并成一个`);
+  }
+  return { md: out, removed, merged };
 }
 
 async function callModel(slot, messages, { json = false, temperature = 0.8, phase } = {}) {
@@ -989,31 +1148,9 @@ async function runTurn(cfg, history, input, { phase } = {}) {
   if (updates.length) {
     try {
       for (let attempt = 0; attempt < 3; attempt++) {
-        let next = md;
-        skippedUpdates = [];
-        for (const u of updates) {
-          if (!u || typeof u !== 'object') {
-            skippedUpdates.push(String(u).slice(0, 60));
-            continue;
-          }
-          const name = String(u.section || '').trim().replace(/^#+\s*/, '');
-          if (!name) {
-            skippedUpdates.push(JSON.stringify(u).slice(0, 80));
-            continue;
-          }
-          // 删除：合并重复栏目时必须用它，光靠改内容是删不掉的
-          if (u.delete === true) {
-            next = removeSection(next, name);
-            continue;
-          }
-          if (typeof u.content !== 'string') {
-            // ⚠ 不要静默跳过。以前这里直接 continue，模型用别的字段表达删除时
-            // 整条被吞掉，外面看起来就是「说了要改，档案却没动」，查都没法查。
-            skippedUpdates.push(`「${name}」既没有 content，也没有 delete 标记`);
-            continue;
-          }
-          next = replaceSection(next, name, u.content);
-        }
+        const applied = applyUpdates(md, updates);
+        const next = applied.md;
+        skippedUpdates = applied.skipped;
         if (skippedUpdates.length) {
           console.warn(`  ⚠ 有 ${skippedUpdates.length} 条更新看不懂，已跳过：${skippedUpdates.join('；')}`);
         }
@@ -1060,6 +1197,9 @@ export {
   salvageReply,
   replaceSection,
   removeSection,
+  dedupeSection,
+  dedupeAllSections,
+  applyUpdates,
   callModel,
   callUntilUsable,
   localNow,

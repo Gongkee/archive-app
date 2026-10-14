@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 档案核心的回归测试。跑这个，不要靠肉眼。
  *
  *   node test.mjs
@@ -23,6 +23,9 @@ import {
   salvageReply,
   replaceSection,
   removeSection,
+  dedupeSection,
+  dedupeAllSections,
+  applyUpdates,
   runTurn,
   localNow,
   parseDataUrl,
@@ -185,6 +188,54 @@ check('删最后一个栏目不会吃掉前面的内容', () => {
 check('删不存在的栏目 = 原样不动', () => {
   const md = replaceSection(HEAD, '心情', '| a |');
   assert.strictEqual(removeSection(md, '根本没有'), md);
+});
+
+console.log('\n── 合并重复栏目（全都是真踩过的）──');
+
+const DUPED = HEAD + '## 宠物\n\n| 橘猫 |\n\n## 东西\n\n| 摩托 |\n\n## 宠物\n\n| 橘猫 |\n| 狗 |\n';
+
+check('dedupeSection 并成一个，且不丢独有的行', () => {
+  const r = dedupeSection(DUPED, '宠物');
+  assert.strictEqual(countH2(r.md, '宠物'), 1);
+  assert.ok(r.md.includes('| 狗 |'), '重复栏目里独有的行被删没了');
+  assert.ok(r.md.includes('| 摩托 |'), '别的栏目被误伤');
+});
+
+check('合并时不会把重复栏目的标题本身并进正文（会又造一个重复）', () => {
+  const r = dedupeSection(DUPED, '宠物');
+  assert.strictEqual(countH2(r.md, '宠物'), 1, '标题被当正文并进去了');
+});
+
+check('dedupeAllSections 扫全篇，不管重复的是哪个栏目', () => {
+  const md = HEAD + '## 甲\n\n| 1 |\n\n## 乙\n\n| 2 |\n\n## 甲\n\n| 3 |\n\n## 乙\n\n| 4 |\n';
+  const r = dedupeAllSections(md);
+  assert.strictEqual(countH2(r.md, '甲'), 1);
+  assert.strictEqual(countH2(r.md, '乙'), 1);
+  for (const v of ['| 1 |', '| 2 |', '| 3 |', '| 4 |']) assert.ok(r.md.includes(v), v + ' 丢了');
+  assert.deepStrictEqual(r.merged.sort(), ['乙', '甲'].sort());
+});
+
+check('同一个栏目既写又删时，写赢（删会连新内容一起删掉）', () => {
+  // 模型表达「宠物重复了，合成一个」就是这么发的
+  const r = applyUpdates(DUPED, [
+    { section: '宠物', content: '| 橘猫 |' },
+    { section: '宠物', delete: true },
+  ]);
+  assert.strictEqual(countH2(r.md, '宠物'), 1, '重复没清掉');
+  assert.ok(r.md.includes('| 狗 |'), '删操作把独有内容弄丢了');
+});
+
+check('模型没碰过的重复栏目，也会被全篇扫掉', () => {
+  const r = applyUpdates(DUPED, [{ section: '东西', content: '| 摩托 |\n| 头盔 |' }]);
+  assert.strictEqual(countH2(r.md, '宠物'), 1, '模型没碰「宠物」，重复就留下来了');
+  assert.ok(r.md.includes('| 狗 |'), '顺手去重不该丢内容');
+  assert.ok(r.md.includes('| 头盔 |'), '这次的更新没写进去');
+});
+
+check('真的删除（没有配套内容）照常生效', () => {
+  const md = replaceSection(HEAD, '临时', '| x |');
+  const r = applyUpdates(md, [{ section: '临时', delete: true }]);
+  assert.strictEqual(countH2(r.md, '临时'), 0);
 });
 
 console.log('\n── 对话历史拼装 ──');
