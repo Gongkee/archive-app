@@ -26,6 +26,10 @@ import {
   dedupeSection,
   dedupeAllSections,
   applyUpdates,
+  appendAdjustment,
+  removeAdjustment,
+  parseAdjustments,
+  buildSystemPrompt,
   runTurn,
   localNow,
   parseDataUrl,
@@ -863,6 +867,118 @@ check('重复三次也能合成一个', () => {
   const r = mergeDuplicateSections(md);
   assert.strictEqual(countH2(r.md, '心情'), 1);
   for (const v of ['| a |', '| b |', '| c |']) assert.ok(r.md.includes(v), v + ' 丢了');
+});
+
+console.log('\n── 小档的调整（它不能自己改自己）──');
+
+check('能从调整文件里把条目抠出来，去掉出处注释', () => {
+  const text = '# 小档的调整\n\n> 说明\n\n- 一次只问一个问题　<!-- 2026-10-16 你说：「你问得太密了」 -->\n- 记录细节多一点\n';
+  assert.deepStrictEqual(parseAdjustments(text), ['一次只问一个问题', '记录细节多一点']);
+});
+
+check('调整会塞进提示词，并且写明「优先于默认设定」和不可覆盖的那几条', () => {
+  const p = buildSystemPrompt('# 档案\n', '2026-10-16 周四 22:00', false, '- 一次只问一个问题');
+  assert.ok(p.includes('ta 给你定的规矩'));
+  assert.ok(p.includes('- 一次只问一个问题'), '规矩没塞进去');
+  assert.ok(p.includes('优先于上面'), '没写优先级');
+  assert.ok(p.includes('不能破'), '没写哪几条不可覆盖');
+});
+
+check('没定过规矩时，提示词也要说明这件事', () => {
+  const p = buildSystemPrompt('# 档案\n', '2026-10-16 周四 22:00', false, '');
+  assert.ok(p.includes('ta 给你定的规矩'));
+  assert.ok(p.includes('还没定过'));
+});
+
+check('提示词里有「请 ta 给你定规矩」那节，并且明说这一轮不能自己写', () => {
+  const p = buildSystemPrompt('# 档案\n', '2026-10-16 周四 22:00', false, '');
+  assert.ok(p.includes('请 ta 给你定规矩'));
+  assert.ok(/这一轮绝对不要自己写进任何文件/.test(p), '没写清它不能自己动手');
+  assert.ok(p.includes('proposeRule'));
+});
+
+await checkAsync('★ 小档提出规矩时，没经 ta 确认一个字都不许写', async () => {
+  const puts = [];
+  installFetch([
+    (u, m) => (decodeURIComponent(u).includes('小档的调整') && m === 'GET' ? jsonRes(404, { message: 'Not Found' }) : null),
+    (u, m) => (u.includes('/contents/journal.md') && m === 'GET' ? jsonRes(200, { content: textToB64(HEAD), sha: 's' }) : null),
+    (u, m, b) => {
+      if (m === 'PUT') {
+        puts.push({ u, b });
+        return jsonRes(200, { content: { sha: 'x' } });
+      }
+      return null;
+    },
+    (u) =>
+      u.includes('/chat/completions')
+        ? modelSays({ reply: '行，那我一次只问一个。', updates: [], proposeRule: '一次只问一个问题' })
+        : null,
+  ]);
+
+  const r = await runTurn(CFG, [], { text: '以后别问那么密', images: [] });
+  assert.strictEqual(r.proposeRule, '一次只问一个问题', '提案没带出来');
+  assert.strictEqual(puts.length, 0, '❗没确认就写进去了 —— 这就是它自己给自己改规矩');
+});
+
+await checkAsync('确认之后才写入，并且留下 ta 的原话当出处', async () => {
+  const puts = [];
+  installFetch([
+    (u, m) => (decodeURIComponent(u).includes('小档的调整') && m === 'GET' ? jsonRes(404, { message: 'Not Found' }) : null),
+    (u, m, b) => {
+      if (decodeURIComponent(u).includes('小档的调整') && m === 'PUT') {
+        puts.push(b);
+        return jsonRes(200, { content: { sha: 'x' } });
+      }
+      return null;
+    },
+  ]);
+
+  const r = await appendAdjustment(CFG.github, '一次只问一个问题', '你问得也太密了，烦');
+  assert.strictEqual(r.added, true);
+  assert.strictEqual(puts.length, 1);
+
+  const written = b64ToText(puts[0].content);
+  assert.ok(written.includes('- 一次只问一个问题'));
+  assert.ok(written.includes('你问得也太密了，烦'), '没留出处，以后查不出来这条从哪来的');
+  assert.ok(written.startsWith('# 小档的调整'), '文件头呢');
+});
+
+await checkAsync('同一条规矩不会重复写进去', async () => {
+  const existing = '# 小档的调整\n\n- 一次只问一个问题\n';
+  let putCount = 0;
+  installFetch([
+    (u, m) => (decodeURIComponent(u).includes('小档的调整') && m === 'GET' ? jsonRes(200, { content: textToB64(existing), sha: 's' }) : null),
+    (u, m) => {
+      if (m === 'PUT') {
+        putCount++;
+        return jsonRes(200, { content: { sha: 'x' } });
+      }
+      return null;
+    },
+  ]);
+  const r = await appendAdjustment(CFG.github, '一次只问一个问题', '又说了一遍');
+  assert.strictEqual(r.added, false);
+  assert.strictEqual(putCount, 0, '重复的又写了一遍');
+});
+
+await checkAsync('能删掉一条规矩', async () => {
+  const existing = '# 小档的调整\n\n- 一次只问一个问题\n- 记录细节多一点\n';
+  const puts = [];
+  installFetch([
+    (u, m) => (decodeURIComponent(u).includes('小档的调整') && m === 'GET' ? jsonRes(200, { content: textToB64(existing), sha: 's' }) : null),
+    (u, m, b) => {
+      if (m === 'PUT') {
+        puts.push(b);
+        return jsonRes(200, { content: { sha: 'x' } });
+      }
+      return null;
+    },
+  ]);
+  const r = await removeAdjustment(CFG.github, '一次只问一个问题');
+  assert.strictEqual(r.removed, true);
+  const after = b64ToText(puts[0].content);
+  assert.ok(!after.includes('一次只问一个问题'), '没删掉');
+  assert.ok(after.includes('记录细节多一点'), '误删了别的');
 });
 
 console.log('\n── 文件与引用 ──');

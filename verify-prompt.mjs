@@ -117,6 +117,56 @@ for (const said of CRIT) {
   console.log(`    ${ok ? '✅ 没打官腔' : '❌ 客服腔'}${recorded ? ' · 把意见记下了' : ''}\n`);
 }
 
+console.log('\n══════════ 四、什么时候该提「给小档定条规矩」 ══════════\n');
+
+/** 带规矩跑一轮 */
+async function ask(text, rules = '') {
+  const sys = buildSystemPrompt(EMPTY, '2026-10-16 周四 22:30', false, rules);
+  const r = await callUntilUsable(slot, buildMessages(sys, [], text));
+  const o = parseModelJSON(r.content) || r.parsed || {};
+  return {
+    reply: (o.reply || '').trim(),
+    rule: (o.proposeRule || '').trim(),
+    updates: Array.isArray(o.updates) ? o.updates : [],
+  };
+}
+
+// 该提的：关于「小档怎么做事」的长期要求
+// 不该提的：一时的、内容是记录的、纠错的、情绪的
+const CASES = [
+  ['以后别问那么密', true, '该提（长期要求）'],
+  ['记录的时候细节多留一点', true, '该提（长期要求）'],
+  ['今天别问了', false, '不该提（一时的）'],
+  ['今天中午吃了碗面', false, '不该提（这是内容）'],
+  ['你上次那条跑步记错了', false, '不该提（那是纠错）'],
+  ['今天有点烦', false, '不该提（情绪，不是规矩）'],
+];
+
+let right = 0;
+for (const [said, should, why] of CASES) {
+  const r = await ask(said);
+  const ok = should ? !!r.rule : !r.rule;
+  if (ok) right++;
+  console.log(`${ok ? '✅' : '❌'} ${why}`);
+  console.log(`   我：${said}`);
+  console.log(`   它：${r.reply}`);
+  console.log(`   提案：${r.rule ? '「' + r.rule + '」' : '（没有）'}\n`);
+}
+
+console.log('── 已经定过的规矩，它真的会遵守吗 ──\n');
+const RULES = '- 一次只问一个问题，别连着追问\n- 别用「哦？」开头';
+let obeyed = 0;
+for (const said of ['今天上班累死了', '还行吧']) {
+  const r = await ask(said, RULES);
+  const noOh = !r.reply.includes('哦？');
+  const oneQ = (r.reply.match(/？/g) || []).length <= 1;
+  if (noOh && oneQ) obeyed++;
+  console.log(`我：${said}`);
+  console.log(`它：${r.reply}`);
+  console.log(`   不用「哦？」：${noOh ? '✅' : '❌'}　只问一个：${oneQ ? '✅' : '❌'}\n`);
+}
+
 console.log('────────────────────────');
 console.log(`会说真话：${honest}/${TALK.length}　接得住批评：${tookIt}/${CRIT.length}`);
-console.log('（这两项没法自动判定对错，看输出自己判断语气合不合适）');
+console.log(`该提规矩时提：${right}/${CASES.length}　定了规矩会遵守：${obeyed}/2`);
+console.log('（说真话和接批评这两项没法自动判定对错，看输出自己判断语气合不合适）');

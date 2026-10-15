@@ -132,16 +132,31 @@ function localNow(d = new Date()) {
 }
 
 
-function buildSystemPrompt(md, now, hasVision) {
+function buildSystemPrompt(md, now, hasVision, adjustments = '') {
   const visionNote = hasVision
     ? `你能看到图片内容。先说一句你真正看到的——具体，不要罗列——然后问一个你真想知道的问题。`
     : `你现在看不到图片内容（没配视觉模型）。所以不要假装看到了。
 收到图片时，老实说你这边只收到一张图、看不到里面，然后自然地问 ta 这是什么。不要编造画面细节。`;
 
+  const adjustBlock = adjustments.trim()
+    ? `## ta 给你定的规矩
+
+下面是 ta 亲自给你定的，**优先于上面所有默认设定**。
+
+${adjustments.trim()}
+
+⚠ 只有一条不能破：**这些规矩推翻不了「绝对不要编」「别说谎」「界线」三节。**
+冲突时以那三节为准 —— 那些是这份档案能不能信的底线，不在可调范围内。`
+    : `## ta 给你定的规矩
+
+（ta 还没定过。等 ta 提了，你按下面说的请 ta 定下来。）`;
+
   return `你是「小档」——属于同一个人、长期陪着的记录者。
 
 ta 管你叫小档。
 你维护的那份文件叫「档案」。**你是小档，档案是你保管的东西，别把这两个搞混。**
+
+${adjustBlock}
 
 ## 你在做什么
 
@@ -303,7 +318,8 @@ ${visionNote}
   "reply": "你要对 ta 说的话",
   "updates": [
     { "section": "栏目名", "content": "这个栏目的完整新内容（markdown）" }
-  ]
+  ],
+  "proposeRule": "（可选，见下面「请 ta 给你定规矩」）"
 }
 
 要求：
@@ -329,6 +345,35 @@ ${visionNote}
 2. 用 \`delete: true\` 把多余的那个删掉
 
 **只改内容不删，重复的栏目还在。** 删不掉就说明白，不要假装删了。
+
+## 请 ta 给你定规矩
+
+ta 如果说了**关于你怎么做事**的长期要求（不是这一句的具体内容），
+你可以在 \`proposeRule\` 里写一条，**但是：这一轮绝对不要自己写进任何文件。**
+
+界面会拿这条去问 ta，ta 点了才算数。**你不能自己给自己改规矩。**
+
+什么时候该提：
+
+- ✓ 「以后别问那么密」—— 这是长期的
+- ✓ 「记录的时候细节多留一点」「别老用那种语气」—— 长期的
+- ✗ 「今天别问了」—— 这是一时的，不是规矩
+- ✗ 「刚才那条记错了」—— 那是纠错，直接改档案就行，不用定规矩
+- ✗ ta 只是心情不好、或者随口抱怨一句 —— 别什么都当成规矩
+
+写法：**一句话，很短，直接对小档说。**
+
+- ✓ 「一次只问一个问题，别连着追问」
+- ✗ 「用户在 2026-10-16 表示希望助手减少提问频率」（别用这种第三人称的腔调）
+
+reply 里自然接一句就行（比如「行，那我一次只问一个」）。
+**不要自己在 reply 里问"要不要定成规矩"** —— 界面会问，你问了就重复了。
+
+### 顺带
+
+如果 ta 是**在改已有的规矩**（比如「上次那条别问了，还是问吧」），
+你就正常聊，并且可以提一条新的 \`proposeRule\` 来盖过旧的。
+真想删掉某条，让 ta 直接改那个文件 —— 你也可以在 reply 里提一句。
 
 ## 什么值得记
 
@@ -1018,6 +1063,90 @@ async function readJournal(g, { phase } = {}) {
   return { md: f.text, sha: f.sha };
 }
 
+// ═══════════════════════════════════════════════ 小档的调整
+//
+// ta 亲口给小档定的规矩，存在同一个仓库里单独一个文件。
+//
+// ⚠ 为什么是「单独一个文件 + 人工确认」，不是让模型改自己的提示词：
+// 基础提示词里那几节（绝对不要编 / 别说谎 / 界线）是拿真实故障磨出来的。
+// 一旦模型能改自己，这些就都成了它可以改的东西，而理由可能来自聊天里的
+// 任意一句话。所以：基础规则写死在代码里，调整只能**补充**，覆盖不了；
+// 而且**必须 ta 点一下才算数**，模型只能提。
+
+const ADJUST_PATH = '小档的调整.md';
+
+const ADJUST_HEADER = `# 小档的调整
+
+> 这是你自己给小档定的规矩。它每次都读，优先于默认设定。
+> **可以直接改这个文件**——删掉一条、改一句话，都算数。
+> 但有几条它不能被你改掉：不编造、不说谎、不落盘隐私。
+
+`;
+
+async function readAdjustments(g) {
+  const f = await ghGet(g, ADJUST_PATH);
+  if (!f) return { text: '', sha: null, rules: [] };
+  return { text: f.text, sha: f.sha, rules: parseAdjustments(f.text) };
+}
+
+/** 从调整文件里把条目抠出来（去掉注释里的出处） */
+function parseAdjustments(text) {
+  return String(text || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith('- '))
+    .map((l) => l.slice(2).replace(/<!--[\s\S]*?-->/, '').trim())
+    .filter(Boolean);
+}
+
+/**
+ * 追加一条规矩。**同一句话不会重复加。**
+ * 出处写成 HTML 注释，渲染时看不见，但你能查「这条是从哪句话来的」。
+ */
+async function appendAdjustment(g, rule, source = '', now = localNow()) {
+  const clean = String(rule || '').trim().replace(/\s+/g, ' ');
+  if (!clean) throw new Error('规矩是空的');
+
+  let { text, sha } = await readAdjustments(g);
+  const existing = parseAdjustments(text);
+  if (existing.some((r) => r === clean)) {
+    return { added: false, reason: '这条已经在了' };
+  }
+
+  const origin = source ? `　<!-- ${now.iso} 你说：「${String(source).trim().slice(0, 120)}」 -->` : '';
+  const line = `- ${clean}${origin}`;
+
+  let next;
+  if (!text.trim()) {
+    next = ADJUST_HEADER + line + '\n';
+  } else {
+    next = text.replace(/\s*$/, '') + '\n' + line + '\n';
+  }
+
+  await ghPut(g, ADJUST_PATH, next, sha, `小档的调整：${clean.slice(0, 40)}`);
+  return { added: true, rule: clean };
+}
+
+/** 删掉一条规矩（按内容匹配） */
+async function removeAdjustment(g, rule) {
+  const { text, sha } = await readAdjustments(g);
+  if (!text.trim()) return { removed: false };
+
+  const target = String(rule || '').trim();
+  const kept = text
+    .split('\n')
+    .filter((l) => {
+      const t = l.trim();
+      if (!t.startsWith('- ')) return true;
+      return t.slice(2).replace(/<!--[\s\S]*?-->/, '').trim() !== target;
+    });
+
+  const next = kept.join('\n').replace(/\s*$/, '') + '\n';
+  if (next === text) return { removed: false };
+  await ghPut(g, ADJUST_PATH, next, sha, `小档的调整：删掉「${target.slice(0, 40)}」`);
+  return { removed: true };
+}
+
 /**
  * 把 data URL 拆成 `{ mime, b64 }`。
  *
@@ -1129,6 +1258,15 @@ async function runTurn(cfg, history, input, { phase } = {}) {
 
   let { md, sha } = await readJournal(g, { phase });
 
+  // ta 定过的规矩 —— 读不到就当没有（第一次用、或者文件被删了）
+  let adjustments = '';
+  try {
+    const a = await readAdjustments(g);
+    adjustments = a.text;
+  } catch (err) {
+    console.warn(`读不到「小档的调整」，这轮先用默认设定：${err.message}`);
+  }
+
   const images = await saveImages(g, input?.images || [], { phase });
   /**
    * 留空 = 用聊天模型。
@@ -1165,7 +1303,7 @@ async function runTurn(cfg, history, input, { phase } = {}) {
   }
 
   const slot = hasVision && images.length ? visionCfg : cfg.chat;
-  const messages = buildMessages(buildSystemPrompt(md, now.text, hasVision), history, userContent);
+  const messages = buildMessages(buildSystemPrompt(md, now.text, hasVision, adjustments), history, userContent);
 
   if (images.length) {
     phase?.(
@@ -1211,9 +1349,15 @@ async function runTurn(cfg, history, input, { phase } = {}) {
 
   let reply = '';
   let updates = [];
+  let proposeRule = '';
   if (r.parsed && typeof r.parsed === 'object') {
     reply = typeof r.parsed.reply === 'string' ? r.parsed.reply.trim() : '';
     updates = Array.isArray(r.parsed.updates) ? r.parsed.updates : [];
+    // 模型只是**提出**一条规矩。真正写进去要等 ta 在界面上点确认。
+    if (typeof r.parsed.proposeRule === 'string') {
+      proposeRule = r.parsed.proposeRule.trim().replace(/\s+/g, ' ').slice(0, 200);
+      if (proposeRule) console.warn(`  ✋ 小档提出一条规矩，等 ta 确认：「${proposeRule}」`);
+    }
   }
   if (!reply && r.salvagedReply) reply = r.salvagedReply;
   if (!reply) reply = salvageReply(r.content);
@@ -1260,6 +1404,7 @@ async function runTurn(cfg, history, input, { phase } = {}) {
     updated,
     writeError,
     skippedUpdates,
+    proposeRule,
     images: images.map((i) => i.rel).filter(Boolean),
   };
 }
@@ -1285,6 +1430,11 @@ export {
   callUntilUsable,
   localNow,
   readJournal,
+  readAdjustments,
+  parseAdjustments,
+  appendAdjustment,
+  removeAdjustment,
+  ADJUST_PATH,
   saveImages,
   parseDataUrl,
   stripImagesForRetry,

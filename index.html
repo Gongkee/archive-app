@@ -59,6 +59,40 @@
   .tag.err{color:var(--bad); border-color:rgba(217,139,95,.4)}
   .daysep{align-self:center; font-size:11px; color:var(--dim2); padding:2px 12px; letter-spacing:.06em}
 
+  /* 小档想给自己定规矩时的确认卡片 —— 它不能自己改，必须 ta 点一下 */
+  .propose{
+    margin-top:4px; padding:11px 13px; border-radius:12px; max-width:100%;
+    border:1px solid rgba(201,162,39,.4); background:rgba(201,162,39,.07);
+    display:flex; flex-direction:column; gap:9px;
+  }
+  .propose .pt{font-size:11px; color:var(--accent); letter-spacing:.04em}
+  .propose .pr{font-size:14px; line-height:1.6; color:var(--fg)}
+  .propose .pb{display:flex; gap:8px}
+  .propose button{
+    flex:1; padding:8px; border-radius:9px; font-family:inherit; font-size:13px;
+    border:1px solid var(--line); background:var(--bg2); color:var(--dim);
+  }
+  .propose button.yes{background:var(--accent); color:#1a1710; border:none; font-weight:600}
+  .propose button:disabled{opacity:.5}
+  .propose .done{font-size:12px; color:var(--dim2)}
+  .propose .done.ok{color:var(--ok)}
+  .propose .done.err{color:var(--bad)}
+
+  .tabs{display:flex; padding:0 16px; border-bottom:1px solid var(--line)}
+  .tabs button{
+    flex:1; padding:10px; font-family:inherit; font-size:13px; background:none;
+    border:none; border-bottom:2px solid transparent; color:var(--dim2);
+  }
+  .tabs button.on{color:var(--fg); border-bottom-color:var(--accent)}
+  .rule{display:flex; align-items:flex-start; gap:10px; padding:11px 0; border-bottom:1px solid var(--line)}
+  .rule .txt{flex:1; font-size:14px; line-height:1.65}
+  .rule .del{
+    flex:0 0 auto; padding:4px 10px; border-radius:8px; font-family:inherit; font-size:12px;
+    border:1px solid var(--line); background:none; color:var(--dim2);
+  }
+  .adjnote{font-size:12px; color:var(--dim2); line-height:1.8; padding:14px 0}
+  .adjempty{font-size:13px; color:var(--dim2); line-height:1.9; padding:20px 0}
+
   #composer{flex:0 0 auto; border-top:1px solid var(--line); padding:10px 12px calc(env(safe-area-inset-bottom) + 10px); background:var(--bg)}
   #thumbs{display:flex; gap:8px; padding:0 0 8px; overflow-x:auto}
   #thumbs .t{position:relative; flex:0 0 auto}
@@ -123,8 +157,20 @@
 
 <div class="overlay" id="ovMd">
   <header><h1>档案</h1><span class="sp"></span><button id="btnMdClose">关闭</button></header>
+  <div class="tabs">
+    <button id="tabJournal" class="on">档案</button>
+    <button id="tabAdjust">小档的调整</button>
+  </div>
   <div id="mdPath"></div>
-  <div class="body"><pre id="md"></pre></div>
+  <div class="body" id="bodyJournal"><pre id="md"></pre></div>
+  <div class="body" id="bodyAdjust" hidden>
+    <div id="adjustList"></div>
+    <div class="adjnote">
+      这是<b>你自己给小档定的规矩</b>，它每次都会读到，优先于默认设定。<br>
+      删掉一条、或者想加一条，都可以直接改仓库里的 <code>小档的调整.md</code>。<br><br>
+      有几条它不能被改掉：<b>不编造、不说谎、不落盘隐私</b>——那些是底线，不在可调范围内。
+    </div>
+  </div>
 </div>
 
 <div class="overlay" id="ovCfg">
@@ -195,7 +241,18 @@
 <div id="toast"></div>
 
 <script type="module">
-import { runTurn, readJournal, localNow, normalizeBaseUrl, fetchWithTimeout, DEFAULT_TIMEOUT_MS, storageSnapshot } from './archive-core.js';
+import {
+  runTurn,
+  readJournal,
+  readAdjustments,
+  appendAdjustment,
+  removeAdjustment,
+  localNow,
+  normalizeBaseUrl,
+  fetchWithTimeout,
+  DEFAULT_TIMEOUT_MS,
+  storageSnapshot,
+} from './archive-core.js';
 
 const $ = (s) => document.querySelector(s);
 const CFG_KEY = 'archive.config.v1';
@@ -356,10 +413,85 @@ function render() {
       }
       d.appendChild(meta);
     }
+
+    // 小档提出一条规矩 —— 它自己不能写，得 ta 点一下
+    if (t.proposeRule) d.appendChild(proposeCard(t));
+
     box.appendChild(d);
     if (t.at) prevAt = t.at;
   }
   scrollDown();
+}
+
+/**
+ * 「小档想给自己定一条规矩」的确认卡片。
+ *
+ * 这是整个功能的关键闸门：**模型只能提，写不写由 ta 决定。**
+ * 它永远不能自己给自己改规矩。
+ */
+function proposeCard(t) {
+  const box = document.createElement('div');
+  box.className = 'propose';
+
+  const title = document.createElement('div');
+  title.className = 'pt';
+  title.textContent = '小档想给自己定一条规矩';
+  box.appendChild(title);
+
+  const rule = document.createElement('div');
+  rule.className = 'pr';
+  rule.textContent = t.proposeRule;
+  box.appendChild(rule);
+
+  if (t.ruleState) {
+    const done = document.createElement('div');
+    done.className = 'done ' + (t.ruleState === 'added' ? 'ok' : t.ruleState === 'error' ? 'err' : '');
+    done.textContent =
+      t.ruleState === 'added'
+        ? '✓ 定下来了，以后每次都算数'
+        : t.ruleState === 'error'
+          ? '没写进去：' + (t.ruleError || '未知错误')
+          : '算了';
+    box.appendChild(done);
+    return box;
+  }
+
+  const bar = document.createElement('div');
+  bar.className = 'pb';
+
+  const yes = document.createElement('button');
+  yes.className = 'yes';
+  yes.textContent = '定下来';
+
+  const no = document.createElement('button');
+  no.textContent = '算了';
+
+  yes.onclick = async () => {
+    yes.disabled = true;
+    no.disabled = true;
+    const cfg = loadCfg();
+    try {
+      // 出处留 ta 的原话 —— 以后查「这条是从哪句话来的」
+      const lastUser = [...turns].reverse().find((x) => x.role === 'user');
+      const r = await appendAdjustment(cfg.github, t.proposeRule, lastUser?.text || '');
+      t.ruleState = 'added';
+      if (r.added === false) t.ruleState = 'added';
+    } catch (err) {
+      t.ruleState = 'error';
+      t.ruleError = err.message;
+    }
+    saveSession();
+    render();
+  };
+  no.onclick = () => {
+    t.ruleState = 'dismissed';
+    saveSession();
+    render();
+  };
+
+  bar.append(yes, no);
+  box.appendChild(bar);
+  return box;
 }
 function scrollDown() {
   const box = $('#chat');
@@ -519,6 +651,8 @@ async function send() {
       text: r.reply || '（没有回复）',
       updated: r.updated,
       writeError: r.writeError || null,
+      // 小档只是**提出**一条规矩，等 ta 点确认才写 —— 见 proposeCard()
+      proposeRule: r.proposeRule || '',
       at: Date.now(),
     });
   } catch (err) {
@@ -546,7 +680,7 @@ $('#input').addEventListener('input', (e) => {
 });
 $('#btnNew').onclick = newSession;
 
-/* ── 看档案 ───────────────────────────── */
+/* ── 看档案 / 小档的调整 ────────────────── */
 async function loadMd() {
   const cfg = loadCfg();
   if (!ghReady(cfg)) {
@@ -562,9 +696,85 @@ async function loadMd() {
     $('#md').textContent = '读不到：' + e.message;
   }
 }
+
+/** 列出 ta 给小档定的规矩，每条可以删 */
+async function loadAdjust() {
+  const cfg = loadCfg();
+  const box = $('#adjustList');
+  box.innerHTML = '';
+
+  if (!ghReady(cfg)) {
+    box.innerHTML = '<div class="adjempty">还没配 GitHub。点右上角「设置」。</div>';
+    return;
+  }
+
+  box.innerHTML = '<div class="adjempty">读取中…</div>';
+  let rules = [];
+  try {
+    rules = (await readAdjustments(cfg.github)).rules;
+  } catch (e) {
+    box.innerHTML = '';
+    const err = document.createElement('div');
+    err.className = 'adjempty';
+    err.textContent = '读不到：' + e.message;
+    box.appendChild(err);
+    return;
+  }
+
+  box.innerHTML = '';
+  if (!rules.length) {
+    box.innerHTML =
+      '<div class="adjempty">还没有。<br><br>你直接跟小档说「以后别问那么密」这种，' +
+      '它会提出来问你要不要定下来 —— <b>它自己改不了</b>，得你点一下。</div>';
+    return;
+  }
+
+  for (const r of rules) {
+    const row = document.createElement('div');
+    row.className = 'rule';
+
+    const txt = document.createElement('div');
+    txt.className = 'txt';
+    txt.textContent = r;
+
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.textContent = '删掉';
+    del.onclick = async () => {
+      if (!confirm('删掉这条规矩？\n\n' + r)) return;
+      del.disabled = true;
+      del.textContent = '删除中';
+      try {
+        await removeAdjustment(cfg.github, r);
+        await loadAdjust();
+      } catch (e) {
+        del.disabled = false;
+        del.textContent = '删掉';
+        toast('删不掉：' + e.message);
+      }
+    };
+
+    row.append(txt, del);
+    box.appendChild(row);
+  }
+}
+
+function showTab(which) {
+  const isJournal = which === 'journal';
+  $('#tabJournal').classList.toggle('on', isJournal);
+  $('#tabAdjust').classList.toggle('on', !isJournal);
+  $('#bodyJournal').hidden = !isJournal;
+  $('#bodyAdjust').hidden = isJournal;
+  $('#mdPath').hidden = !isJournal;
+  if (isJournal) loadMd();
+  else loadAdjust();
+}
+
+$('#tabJournal').onclick = () => showTab('journal');
+$('#tabAdjust').onclick = () => showTab('adjust');
 $('#btnMd').onclick = () => {
   $('#ovMd').classList.add('on');
-  loadMd();
+  showTab('journal');
 };
 $('#btnMdClose').onclick = () => $('#ovMd').classList.remove('on');
 
